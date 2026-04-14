@@ -1,0 +1,59 @@
+{
+  "hot_sectors_count": 2,
+  "potential_sectors_count": 3,
+  "stocks_per_sector": 2,
+  "ema_short": 13,
+  "ema_long": 55,
+  "ma_periods": [5, 10, 20, 60],
+  "pullback_threshold": 0.015,
+  "analysis_days": [5, 10, 20],
+  "rps_periods": [10, 20, 50, 120, 250],
+  "rps_threshold": 90,
+  "report_time": "17:00",
+  "use_cache": true,
+  "sector_member_limit": 20,
+  "min_stock_score": 55,
+  "concept_scan_limit": 20,
+  "concept_match_limit": 5,
+  "concept_overlap_min_count": 2,
+  "concept_overlap_min_ratio": 0.1,
+  "score_weights": {
+    "sector": {
+      "change_pct": 30,
+      "fund_flow": 30,
+      "up_ratio": 25,
+      "turnover": 15,
+      "trend_bonus": 5,
+      "concept_boost": 5
+    },
+    "stock": {
+      "ema_bullish": 30,
+      "ema_rising": 15,
+      "pullback": 40,
+      "ma_bullish": 15,
+      "volume_confirm": 10,
+      "low_risk": 10,
+      "sector_leader": 10,
+      "rps_three_cycle_red": 8,
+      "rps_four_cycle_red": 15,
+      "big_order_alert": 8,
+      "macd_ignite": 6,
+      "turnaround": 10,
+      "breakout": 18
+    }
+  },
+  "risk_filters": {
+    "high_pe_warning": 100,
+    "exclude_negative_pe": false,
+    "max_change_5d": 12.0,
+    "max_vol_ratio": 2.5,
+    "max_volatility_10d": 8.0,
+    "strict_mode": false
+  },
+  "backtest": {
+    "lookback_days": 30,
+    "holding_days": [1, 3, 5],
+    "min_samples": 5,
+    "entry_price_basis": "signal_close"
+  }
+}
