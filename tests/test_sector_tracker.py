@@ -144,6 +144,49 @@ class SectorTrackerUnitTests(unittest.TestCase):
         self.assertTrue(classified["potential"][0]["concept_boost"])
         self.assertEqual(classified["potential"][0]["related_concepts"], ["AI Robotics"])
 
+    def test_classify_sectors_excludes_data_boards_and_uses_config_counts(self):
+        config = st.deep_merge(
+            st.DEFAULT_CONFIG,
+            {
+                "hot_sectors_count": 8,
+                "potential_sectors_count": 8,
+                "excluded_sector_keywords": ["连板", "二板"],
+            },
+        )
+        industries = []
+        for index in range(18):
+            industries.append(
+                {
+                    "name": f"行业{index}",
+                    "change_pct": 2.0 - index * 0.05,
+                    "up_count": 8,
+                    "down_count": 2,
+                    "turnover": 2.0,
+                    "lead_change": 3.0,
+                    "type": "industry",
+                }
+            )
+        industries.insert(
+            0,
+            {
+                "name": "昨日连板",
+                "change_pct": 9.0,
+                "up_count": 10,
+                "down_count": 0,
+                "turnover": 8.0,
+                "lead_change": 10.0,
+                "type": "industry",
+            },
+        )
+
+        classified = st.classify_sectors(industries, [{"name": "二板", "change_pct": 8.0}], {}, config)
+
+        names = [item["name"] for item in classified["hot"] + classified["potential"] + classified["hot_concepts"]]
+        self.assertNotIn("昨日连板", names)
+        self.assertNotIn("二板", names)
+        self.assertEqual(len(classified["hot"]), 8)
+        self.assertLessEqual(len(classified["potential"]), 8)
+
     def test_apply_pick_filters_respects_flags(self):
         args = types.SimpleNamespace(
             sector=["Robotics"],
@@ -834,6 +877,76 @@ class SectorTrackerUnitTests(unittest.TestCase):
         self.assertIn("边缘候选", report)
         self.assertIn("Alpha", report)
 
+    def test_breakout_pool_persists_entries_and_uses_20pct_break_price_stop(self):
+        original_db_path = st.DB_PATH
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                st.DB_PATH = Path(temp_dir) / "sector_history.db"
+                st.init_db()
+                st.upsert_breakout_pool_entries(
+                    [
+                        {
+                            "code": "000001",
+                            "name": "Alpha",
+                            "sector": "Robotics",
+                            "pool_status": "watch",
+                            "breakout_price": 10.0,
+                            "price": 9.2,
+                            "ema55": 8.8,
+                            "score": 62,
+                            "signal": "前高突破",
+                        }
+                    ],
+                    "2026-04-14",
+                )
+                active = st.load_active_breakout_pool()
+                self.assertEqual(active[0]["code"], "000001")
+
+                config = st.deep_merge(st.DEFAULT_CONFIG, {"breakout_pool": {"break_below_breakout_pct": 0.20}})
+                self.assertEqual(st.get_breakout_pool_remove_reason({"price": 8.1, "breakout_price": 10.0}, config), "")
+                self.assertEqual(
+                    st.get_breakout_pool_remove_reason({"price": 7.99, "breakout_price": 10.0}, config),
+                    "跌破突破价20%",
+                )
+        finally:
+            st.DB_PATH = original_db_path
+
+    def test_prune_breakout_pool_overflow_keeps_status_score_and_amount(self):
+        original_db_path = st.DB_PATH
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                st.DB_PATH = Path(temp_dir) / "sector_history.db"
+                st.init_db()
+                st.upsert_breakout_pool_entries(
+                    [
+                        {"code": "000001", "name": "Low", "sector": "Pool", "pool_status": "watch", "breakout_price": 10, "price": 10, "score": 60, "amount": 1},
+                        {"code": "000002", "name": "HighAmount", "sector": "Pool", "pool_status": "watch", "breakout_price": 10, "price": 10, "score": 60, "amount": 9},
+                        {"code": "000003", "name": "Pullback", "sector": "Pool", "pool_status": "pullback", "breakout_price": 10, "price": 10, "score": 50, "amount": 1},
+                    ],
+                    "2026-04-14",
+                )
+                config = st.deep_merge(st.DEFAULT_CONFIG, {"breakout_pool": {"max_size": 2}})
+                removed = st.prune_breakout_pool_overflow(config, "2026-04-14")
+                active_codes = {item["code"] for item in st.load_active_breakout_pool()}
+
+                self.assertEqual([item["code"] for item in removed], ["000001"])
+                self.assertEqual(active_codes, {"000002", "000003"})
+        finally:
+            st.DB_PATH = original_db_path
+
+    def test_select_breakout_pool_picks_keeps_pullback_even_below_score(self):
+        config = st.deep_merge(st.DEFAULT_CONFIG, {"breakout_pool": {"pick_limit": 2}, "min_stock_score": 70})
+        pool_state = {
+            "enabled": True,
+            "tracked": [
+                {"code": "000001", "name": "Alpha", "sector": "Robotics", "pool_status": "pullback", "score": 55},
+                {"code": "000002", "name": "Beta", "sector": "Robotics", "pool_status": "tracking", "score": 72},
+                {"code": "000003", "name": "Gamma", "sector": "Robotics", "pool_status": "tracking", "score": 50},
+            ],
+        }
+        picks = st.select_breakout_pool_picks(pool_state, config)
+        self.assertEqual([item["code"] for item in picks], ["000001", "000002"])
+
     def test_evaluate_saved_picks_uses_signal_close_entry_price(self):
         original_db_path = st.DB_PATH
         original_get_stock_history = st.get_stock_history
@@ -1043,6 +1156,13 @@ class SectorTrackerUnitTests(unittest.TestCase):
             alerts,
             config,
             scan_stats={"stage_counts": {"members_seen": 3, "members_scanned": 2, "light_passed": 1, "score_passed": 1, "selected": 1}, "reject_reasons": {"趋势未通过": 1}},
+            breakout_pool={
+                "enabled": True,
+                "active_count": 3,
+                "new_entries": [],
+                "tracked": [{"name": "Beta", "code": "000002", "sector": "Automation", "pool_status": "pullback", "score": 66, "price": 12.3, "breakout_price": 11.8}],
+                "removed": [],
+            },
         )
         self.assertIn("2026-04-14", report)
         self.assertIn("2026-04-13", report)
@@ -1054,6 +1174,8 @@ class SectorTrackerUnitTests(unittest.TestCase):
         self.assertIn("参考止盈线", report)
         self.assertIn("筛选诊断", report)
         self.assertIn("趋势未通过", report)
+        self.assertIn("突破股票池", report)
+        self.assertIn("Beta", report)
 
 
 if __name__ == "__main__":

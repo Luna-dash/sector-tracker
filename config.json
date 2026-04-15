@@ -1,6 +1,6 @@
 {
-  "hot_sectors_count": 2,
-  "potential_sectors_count": 3,
+  "hot_sectors_count": 8,
+  "potential_sectors_count": 8,
   "stocks_per_sector": 2,
   "ema_short": 13,
   "ema_long": 55,
@@ -22,6 +22,20 @@
   "edge_candidates_limit": 10,
   "edge_candidate_score_gap": 5,
   "rps_min_sample": 5,
+  "merge_similar_sectors": true,
+  "excluded_sector_keywords": [
+    "昨日涨停",
+    "昨日连板",
+    "昨日触板",
+    "首板",
+    "连板",
+    "二板",
+    "三板",
+    "一字板",
+    "涨停板",
+    "涨停股池",
+    "龙虎榜"
+  ],
   "light_breakout_setup": {
     "near_high_window": 120,
     "near_high_pct": 0.92,
@@ -66,6 +80,19 @@
   "concept_match_limit": 5,
   "concept_overlap_min_count": 2,
   "concept_overlap_min_ratio": 0.1,
+  "breakout_pool": {
+    "enabled": true,
+    "min_size": 30,
+    "max_size": 100,
+    "seed_breakout_days": 5,
+    "track_limit_per_run": 100,
+    "pick_limit": 10,
+    "full_market_scan_limit": 600,
+    "break_below_breakout_pct": 0.2,
+    "ema55_break_days": 2,
+    "max_watch_days": 20,
+    "min_amount": 0
+  },
   "score_weights": {
     "sector": {
       "change_pct": 30,

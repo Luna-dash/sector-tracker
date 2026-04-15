@@ -9,9 +9,11 @@
 - 板块扫描：读取行业板块、概念板块、资金流，生成热门板块和潜力板块。
 - 个股轻筛：先用较短历史做趋势、EMA55、板块池 RPS、突破迹象筛选，减少长历史请求。
 - 个股精筛：对轻筛通过的股票读取长历史，识别前高突破、回踩缩量、确认放量等结构。
+- 突破股票池：把近期前高突破的个股写入 SQLite，后续持续跟踪回踩、确认和剔除。
 - 评分拆解：输出基础分、RPS 分、量价分、突破分、策略分、风险扣分和最终分。
 - 筛选诊断：统计每一步通过数、淘汰原因、边缘候选和跨板块去重数量。
 - 共振识别：同一股票被多个强势板块选中时，保留最高分来源并记录所有来源板块。
+- 板块清理：默认过滤昨日连板、二板、涨停板等纯数据类板块，避免它们干扰主题判断。
 - 缓存优化：支持磁盘缓存和运行期内存缓存，减少同一轮运行内的重复读取和重复请求。
 - 输出控制：可生成 Markdown 日报和 JSON，也可只打印结果，避免调参时产生过多报告文件。
 
@@ -27,6 +29,12 @@ pip install akshare baostock pandas numpy
 
 ```bash
 python sector_tracker.py
+```
+
+主动全市场扫描并更新突破股票池：
+
+```bash
+python sector_tracker.py --update-breakout-pool --skip-backtest
 ```
 
 跳过回测：
@@ -101,6 +109,7 @@ JSON 里的重点字段：
 
 - `classified`：热门板块、潜力板块、热点概念。
 - `stock_picks`：最终入选股票。
+- `breakout_pool`：突破股票池状态，包括新入池、跟踪、回踩候选、确认信号和剔除记录。
 - `stock_candidates`：候选池明细，受 `export_candidates` 控制。
 - `edge_candidates`：接近入选或有结构亮点但未入选的股票。
 - `scan_stats`：扫描统计和淘汰原因。
@@ -111,6 +120,7 @@ JSON 里的重点字段：
 主要配置在 `config.json`：
 
 - `stocks_per_sector`：每个板块保留的股票数量。
+- `hot_sectors_count` / `potential_sectors_count`：日报默认展示的热门、潜力板块数量，当前默认 8/8。
 - `sector_member_limit`：每个板块最多扫描多少成员。
 - `min_stock_score`：最终入选最低分。
 - `history_window_days`：长历史窗口。
@@ -119,8 +129,15 @@ JSON 里的重点字段：
 - `track_candidates`：是否内部追踪候选池。
 - `export_candidates`：是否把完整候选池写入 JSON。
 - `rps_min_sample`：板块池 RPS 生效所需最小样本数。
+- `excluded_sector_keywords`：需要剔除的纯数据类板块关键词。
 - `light_breakout_setup`：轻筛突破迹象阈值。
 - `anchored_breakout`：前高突破和量价确认阈值。
+- `breakout_pool`：突破池配置；池子不足或使用 `--update-breakout-pool` 时可全市场补池，默认最多 100 只，最近 5 日突破可入池，跌破突破价 20% 或连续跌破 EMA55 会剔除。
+
+突破池剔除只来自两类情况：
+
+- 规则剔除：跌破突破价阈值、连续跌破 EMA55、超过观察期仍未形成回踩确认。
+- 池满淘汰：超过 `max_size` 后，优先保留确认信号、回踩候选、高分、高成交额股票，末尾标记为“池满末位淘汰”。
 - `risk_filters`：风险硬过滤和软扣分。
 
 ## 使用注意

@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -32,8 +33,8 @@ CONFIG_PATH = BASE_DIR / "config.json"
 CACHE_DIR = BASE_DIR / "cache"
 
 DEFAULT_CONFIG = {
-    "hot_sectors_count": 4,
-    "potential_sectors_count": 7,
+    "hot_sectors_count": 8,
+    "potential_sectors_count": 8,
     "stocks_per_sector": 3,
     "ema_short": 13,
     "ema_long": 55,
@@ -55,6 +56,20 @@ DEFAULT_CONFIG = {
     "edge_candidates_limit": 10,
     "edge_candidate_score_gap": 5,
     "rps_min_sample": 5,
+    "merge_similar_sectors": True,
+    "excluded_sector_keywords": [
+        "昨日涨停",
+        "昨日连板",
+        "昨日触板",
+        "首板",
+        "连板",
+        "二板",
+        "三板",
+        "一字板",
+        "涨停板",
+        "涨停股池",
+        "龙虎榜",
+    ],
     "light_breakout_setup": {
         "near_high_window": 120,
         "near_high_pct": 0.92,
@@ -99,6 +114,19 @@ DEFAULT_CONFIG = {
     "concept_match_limit": 5,
     "concept_overlap_min_count": 2,
     "concept_overlap_min_ratio": 0.1,
+    "breakout_pool": {
+        "enabled": True,
+        "min_size": 30,
+        "max_size": 100,
+        "seed_breakout_days": 5,
+        "track_limit_per_run": 100,
+        "pick_limit": 10,
+        "full_market_scan_limit": 600,
+        "break_below_breakout_pct": 0.20,
+        "ema55_break_days": 2,
+        "max_watch_days": 20,
+        "min_amount": 0,
+    },
     "score_weights": {
         "sector": {
             "change_pct": 30,
@@ -268,6 +296,11 @@ def load_config():
     config["edge_candidates_limit"] = max(0, int(config.get("edge_candidates_limit", 10)))
     config["edge_candidate_score_gap"] = max(0.0, float(config.get("edge_candidate_score_gap", 5)))
     config["rps_min_sample"] = max(1, int(config.get("rps_min_sample", 5)))
+    config["merge_similar_sectors"] = bool(config.get("merge_similar_sectors", True))
+    excluded_keywords = config.get("excluded_sector_keywords", DEFAULT_CONFIG["excluded_sector_keywords"])
+    if not isinstance(excluded_keywords, list):
+        excluded_keywords = DEFAULT_CONFIG["excluded_sector_keywords"]
+    config["excluded_sector_keywords"] = [str(item).strip() for item in excluded_keywords if str(item).strip()]
     config["concept_scan_limit"] = max(5, int(config.get("concept_scan_limit", 20)))
     config["concept_match_limit"] = max(1, int(config.get("concept_match_limit", 5)))
     config["concept_overlap_min_count"] = max(1, int(config.get("concept_overlap_min_count", 2)))
@@ -415,6 +448,24 @@ def load_config():
     risk_cfg["soft_penalties"] = {key: max(0.0, float(value)) for key, value in soft_penalties.items()}
     config["risk_filters"] = risk_cfg
 
+    pool_cfg = deep_merge(DEFAULT_CONFIG.get("breakout_pool", {}), config.get("breakout_pool", {}))
+    pool_cfg["enabled"] = bool(pool_cfg.get("enabled", True))
+    pool_cfg["min_size"] = max(0, int(pool_cfg.get("min_size", 30)))
+    pool_cfg["max_size"] = max(1, int(pool_cfg.get("max_size", 100)))
+    pool_cfg["min_size"] = min(pool_cfg["min_size"], pool_cfg["max_size"])
+    pool_cfg["seed_breakout_days"] = max(1, int(pool_cfg.get("seed_breakout_days", 5)))
+    pool_cfg["track_limit_per_run"] = max(1, int(pool_cfg.get("track_limit_per_run", 100)))
+    pool_cfg["pick_limit"] = max(0, int(pool_cfg.get("pick_limit", 10)))
+    pool_cfg["full_market_scan_limit"] = max(0, int(pool_cfg.get("full_market_scan_limit", 600)))
+    pool_cfg["break_below_breakout_pct"] = min(
+        0.5,
+        max(0.0, float(pool_cfg.get("break_below_breakout_pct", 0.20))),
+    )
+    pool_cfg["ema55_break_days"] = max(1, int(pool_cfg.get("ema55_break_days", 2)))
+    pool_cfg["max_watch_days"] = max(1, int(pool_cfg.get("max_watch_days", 20)))
+    pool_cfg["min_amount"] = max(0.0, float(pool_cfg.get("min_amount", 0)))
+    config["breakout_pool"] = pool_cfg
+
     backtest_cfg = config.get("backtest", {})
     holding_days = backtest_cfg.get("holding_days", [1, 3, 5])
     if not isinstance(holding_days, list) or not holding_days:
@@ -447,6 +498,7 @@ def parse_args():
     parser.add_argument("--output-json", help="custom json output path")
     parser.add_argument("--no-output-files", action="store_true", help="skip writing markdown/json report files")
     parser.add_argument("--skip-backtest", action="store_true", help="skip backtest summary")
+    parser.add_argument("--update-breakout-pool", action="store_true", help="actively scan full market and add recent breakout stocks to the pool")
     return parser.parse_args()
 
 
@@ -672,9 +724,33 @@ def init_db():
         )
         """
     )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS breakout_stock_pool (
+            stock_code TEXT PRIMARY KEY,
+            stock_name TEXT NOT NULL,
+            sector_name TEXT,
+            source TEXT,
+            status TEXT NOT NULL,
+            first_breakout_date TEXT,
+            last_seen_date TEXT,
+            breakout_price REAL,
+            current_price REAL,
+            ema55 REAL,
+            score REAL,
+            signal TEXT,
+            remove_reason TEXT,
+            metadata TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sector_ranking_date ON daily_sector_ranking(date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_stock_picks_date ON daily_stock_picks(date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_market_snapshots_date ON market_snapshots(date)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_breakout_pool_status ON breakout_stock_pool(status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_breakout_pool_seen ON breakout_stock_pool(last_seen_date)")
     conn.commit()
     conn.close()
 
@@ -976,6 +1052,69 @@ def get_fund_flow_rank(use_cache=True, cache_only=False):
     )
 
 
+def normalize_stock_spot_row(row):
+    code = str(row.get("代码", row.get("code", ""))).strip().zfill(6)
+    return {
+        "code": code,
+        "name": str(row.get("名称", row.get("name", ""))).strip(),
+        "price": to_float(row.get("最新价", row.get("price", 0))),
+        "change_pct": to_float(row.get("涨跌幅", row.get("change_pct", 0))),
+        "volume": to_float(row.get("成交量", row.get("volume", 0))),
+        "amount": to_float(row.get("成交额", row.get("amount", 0))),
+        "turnover": to_float(row.get("换手率", row.get("turnover", 0))),
+        "pe": to_float(row.get("市盈率-动态", row.get("市盈率", row.get("pe", 0)))),
+        "pb": to_float(row.get("市净率", row.get("pb", 0))),
+    }
+
+
+def is_tradeable_a_stock(stock):
+    code = str(stock.get("code", ""))
+    name = str(stock.get("name", ""))
+    if not code or code.startswith(("4", "8")):
+        return False
+    if not code.startswith(("0", "3", "6")):
+        return False
+    if "ST" in name or stock.get("price", 0) <= 0:
+        return False
+    return True
+
+
+def get_all_market_stocks(use_cache=True, cache_only=False, snapshot_date=None):
+    snapshot_date = snapshot_date or datetime.now().strftime("%Y-%m-%d")
+    cache_name = f"all_market_{snapshot_date.replace('-', '')}"
+    memory_cached = runtime_cache_get("all_market_stocks", cache_name, enabled=use_cache)
+    if memory_cached is not None:
+        bump_cache_stat("all_market_stocks", "memory")
+        return memory_cached
+    if use_cache:
+        cached = load_cache(cache_name)
+        if cached:
+            bump_cache_stat("all_market_stocks", "cache")
+            return runtime_cache_set("all_market_stocks", cache_name, cached.get("data", []), enabled=use_cache)
+    if cache_only:
+        note("cache-only mode: no cache available for all market stocks")
+        return []
+
+    try:
+        df = ak.stock_zh_a_spot_em()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("get all market stocks failed: %s", exc)
+        return []
+
+    result = []
+    for _, row in df.iterrows():
+        item = normalize_stock_spot_row(row)
+        if is_tradeable_a_stock(item):
+            result.append(item)
+    result = rank_sector_members(result)
+    if use_cache:
+        save_cache(cache_name, {"data": result})
+    runtime_cache_set("all_market_stocks", cache_name, result, enabled=use_cache)
+    bump_cache_stat("all_market_stocks", "live")
+    record_source("all_market_stocks", "live", records=len(result), cache_name=cache_name)
+    return result
+
+
 def get_sector_members(
     sector_name,
     sector_type="industry",
@@ -1041,7 +1180,7 @@ def build_hot_concept_member_map(concept_sectors, config, analysis_date, use_cac
     hot_concepts = [
         item
         for item in concept_sectors[: config["concept_scan_limit"]]
-        if item.get("change_pct", 0) > 2
+        if item.get("change_pct", 0) > 2 and not is_excluded_sector(item, config)
     ]
     member_map = defaultdict(list)
     concept_members = {}
@@ -1891,9 +2030,40 @@ def score_sector(sector, fund_flows, config):
     return sector
 
 
+def is_excluded_sector(sector, config):
+    name = str(sector.get("name", ""))
+    return any(keyword and keyword in name for keyword in config.get("excluded_sector_keywords", []))
+
+
+def normalize_sector_family_name(name):
+    value = re.sub(r"[（(].*?[）)]", "", str(name))
+    value = re.sub(r"[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩIVX]+$", "", value)
+    value = re.sub(r"(行业|概念|板块)$", "", value)
+    return re.sub(r"\s+", "", value)
+
+
+def dedupe_similar_sectors(sectors, config):
+    if not config.get("merge_similar_sectors", True):
+        return sectors
+    deduped = []
+    seen = set()
+    for sector in sectors:
+        family = normalize_sector_family_name(sector.get("name", ""))
+        if family in seen:
+            continue
+        seen.add(family)
+        deduped.append(sector)
+    return deduped
+
+
 def classify_sectors(industry_sectors, concept_sectors, fund_flows, config):
-    scored_industries = [score_sector(dict(item), fund_flows, config) for item in industry_sectors]
-    industry_sorted = sorted(scored_industries, key=lambda item: item["score"], reverse=True)
+    filtered_industries = [item for item in industry_sectors if not is_excluded_sector(item, config)]
+    filtered_concepts = [item for item in concept_sectors if not is_excluded_sector(item, config)]
+    scored_industries = [score_sector(dict(item), fund_flows, config) for item in filtered_industries]
+    industry_sorted = dedupe_similar_sectors(
+        sorted(scored_industries, key=lambda item: item["score"], reverse=True),
+        config,
+    )
 
     hot_count = config["hot_sectors_count"]
     potential_count = config["potential_sectors_count"]
@@ -1912,7 +2082,7 @@ def classify_sectors(industry_sectors, concept_sectors, fund_flows, config):
             potential_candidates.append(sector)
 
     potential = sorted(potential_candidates, key=lambda item: item["score"], reverse=True)[:potential_count]
-    hot_concepts = [item for item in concept_sectors if item["change_pct"] > 2][:10]
+    hot_concepts = [item for item in filtered_concepts if item["change_pct"] > 2][:10]
     return {"hot": hot, "potential": potential, "hot_concepts": hot_concepts}
 
 
@@ -2546,6 +2716,506 @@ def finalize_score_components(components):
     return components
 
 
+def strip_internal_stock_fields(item):
+    item.pop("risk_notes", None)
+    item.pop("base_score", None)
+    item.pop("_history", None)
+    return item
+
+
+def load_active_breakout_pool():
+    if not DB_PATH.exists():
+        return []
+    conn = sqlite3.connect(str(DB_PATH))
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT stock_code, stock_name, sector_name, source, status, first_breakout_date,
+               last_seen_date, breakout_price, current_price, ema55, score, signal, metadata
+        FROM breakout_stock_pool
+        WHERE status != 'removed'
+        ORDER BY updated_at DESC
+        """
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    result = []
+    for row in rows:
+        metadata = {}
+        if row[12]:
+            try:
+                metadata = json.loads(row[12])
+            except ValueError:
+                metadata = {}
+        result.append(
+            {
+                "code": row[0],
+                "name": row[1],
+                "sector": row[2] or "突破池",
+                "source": row[3] or "breakout_pool",
+                "pool_status": row[4],
+                "first_breakout_date": row[5],
+                "last_seen_date": row[6],
+                "breakout_price": to_float(row[7]),
+                "current_price": to_float(row[8]),
+                "ema55": to_float(row[9]),
+                "score": to_float(row[10]),
+                "signal": row[11] or "观察",
+                "metadata": metadata,
+                "pe": to_float(metadata.get("pe")),
+                "amount": to_float(metadata.get("amount")),
+                "turnover": to_float(metadata.get("turnover")),
+            }
+        )
+    return result
+
+
+def upsert_breakout_pool_entries(entries, analysis_date):
+    if not entries:
+        return []
+    init_db()
+    conn = sqlite3.connect(str(DB_PATH))
+    cursor = conn.cursor()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    saved = []
+    for item in entries:
+        code = str(item.get("code", "")).zfill(6)
+        if not code:
+            continue
+        metadata = {
+            "pe": item.get("pe", 0),
+            "amount": item.get("amount", 0),
+            "turnover": item.get("turnover", 0),
+            "anchored_breakout_day": item.get("anchored_breakout_day"),
+            "anchor_date": item.get("anchor_date"),
+            "volume_price_summary": item.get("volume_price_summary", ""),
+            "signal_breakdown_summary": item.get("signal_breakdown_summary", ""),
+        }
+        cursor.execute("SELECT first_breakout_date, created_at FROM breakout_stock_pool WHERE stock_code = ?", (code,))
+        existing = cursor.fetchone()
+        first_breakout_date = (
+            existing[0]
+            if existing and existing[0]
+            else item.get("breakout_date") or item.get("first_breakout_date") or analysis_date
+        )
+        created_at = existing[1] if existing and existing[1] else now
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO breakout_stock_pool
+            (stock_code, stock_name, sector_name, source, status, first_breakout_date, last_seen_date,
+             breakout_price, current_price, ema55, score, signal, remove_reason, metadata, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+            """,
+            (
+                code,
+                item.get("name", ""),
+                item.get("sector", "突破池"),
+                item.get("pool_source", item.get("source", "breakout_pool")),
+                item.get("pool_status", "watch"),
+                first_breakout_date,
+                analysis_date,
+                to_float(item.get("breakout_price") or item.get("anchor_price")),
+                to_float(item.get("price") or item.get("current_price")),
+                to_float(item.get("ema55")),
+                to_float(item.get("score")),
+                item.get("signal", "观察"),
+                json.dumps(metadata, ensure_ascii=False, default=json_default),
+                created_at,
+                now,
+            ),
+        )
+        saved.append(code)
+    conn.commit()
+    conn.close()
+    return saved
+
+
+def mark_breakout_pool_removed(code, reason, analysis_date):
+    conn = sqlite3.connect(str(DB_PATH))
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE breakout_stock_pool
+        SET status = 'removed', remove_reason = ?, last_seen_date = ?, updated_at = ?
+        WHERE stock_code = ?
+        """,
+        (reason, analysis_date, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), code),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_pool_first_breakout_age(entry, analysis_date):
+    first_date = entry.get("first_breakout_date")
+    if not first_date:
+        return 0
+    try:
+        return max(0, (datetime.strptime(analysis_date, "%Y-%m-%d") - datetime.strptime(first_date, "%Y-%m-%d")).days)
+    except ValueError:
+        return 0
+
+
+def count_consecutive_below_ema55(df, config):
+    if df.empty or len(df) < config["ema_long"]:
+        return 0
+    close = df["close"].astype(float)
+    ema55 = calc_ema(close, config["ema_long"])
+    count = 0
+    for idx in range(len(close) - 1, -1, -1):
+        if close.iloc[idx] < ema55.iloc[idx]:
+            count += 1
+        else:
+            break
+    return count
+
+
+def build_pool_status(item):
+    if item.get("is_pullback") and item.get("confirm_volume_price_pass"):
+        return "confirm"
+    if item.get("is_pullback"):
+        return "pullback"
+    if item.get("anchored_breakout_signal"):
+        return "watch"
+    return "tracking"
+
+
+def evaluate_breakout_pool_stock(stock, config, analysis_date, use_cache=True, cache_only=False):
+    df_hist = get_stock_history(
+        stock["code"],
+        end_date=analysis_date,
+        days=get_full_history_days(config),
+        use_cache=use_cache,
+        cache_only=cache_only,
+    )
+    if df_hist.empty:
+        return None, "长历史缺失"
+    tech = analyze_stock_tech(df_hist, config)
+    if not tech:
+        return None, "技术指标不足"
+
+    is_pullback, conditions = check_pullback_signal(tech, config)
+    matched, failed = build_condition_summary(conditions)
+    risk_notes, risk_penalty, blocked = build_risk_assessment(stock, tech, config)
+    if blocked and config["risk_filters"]["strict_mode"]:
+        return None, "风险过滤"
+
+    weights = config["score_weights"]["stock"]
+    score_components = build_initial_score_components(tech, is_pullback, risk_notes, risk_penalty, False, weights)
+    item = {
+        "sector": stock.get("sector") or "突破池",
+        "code": stock["code"],
+        "name": stock.get("name", ""),
+        "price": round(tech["price"], 2),
+        "change_pct": round(calc_latest_change_pct(df_hist), 2),
+        "ema13": round(tech["ema13"], 2),
+        "ema55": round(tech["ema55"], 2),
+        "ema13_dist_pct": round(tech["ema13_dist_pct"] * 100, 2),
+        "signal": get_signal_type(tech, is_pullback),
+        "is_pullback": is_pullback,
+        "score": 0.0,
+        "pe": to_float(stock.get("pe")),
+        "vol_ratio": round(tech["vol_ratio"], 2),
+        "change_5d": round(tech["change_5d"], 2),
+        "change_10d": round(tech["change_10d"], 2),
+        "change_50d": round(tech.get("change_50d", 0), 2),
+        "change_120d": round(tech.get("change_120d", 0), 2),
+        "change_250d": round(tech.get("change_250d", 0), 2),
+        "volatility_10d": round(tech["volatility_10d"], 2),
+        "risk": "；".join(risk_notes),
+        "risk_notes": risk_notes,
+        "signal_grade": "C",
+        "is_sector_leader": False,
+        "amount": round(to_float(stock.get("amount")), 2),
+        "turnover": round(to_float(stock.get("turnover")), 2),
+        "hot_topic": "",
+        "matched_conditions": matched,
+        "failed_conditions": failed,
+        "base_score": score_components["base_score"],
+        "score_components": score_components,
+        "signal_breakdown": build_initial_signal_breakdown(tech),
+        "basic_volume_pass": bool(tech["vol_ratio"] > config["light_breakout_setup"]["min_vol_ratio"] and tech["change_5d"] > 0),
+        "breakout_setup_pass": has_light_breakout_setup(df_hist, tech, config),
+        "rps_summary": "突破池跟踪，RPS不作为入池前置条件",
+        "three_cycle_red": False,
+        "four_cycle_red": False,
+        "rps_strong_periods": 0,
+        "volume_quality_score": 0.0,
+        "volume_quality_grade": "D",
+        "volume_quality_summary": "",
+        "_history": df_hist,
+        "summary": "",
+    }
+    strategy_state = build_daily_strategy_state(df_hist, item, config)
+    item.update(strategy_state)
+    item["signal_breakdown"].update(
+        {
+            "rps_pass": False,
+            "breakout_setup_pass": bool(item.get("breakout_setup_pass")),
+            "anchored_breakout_pass": bool(item.get("anchored_breakout_signal")),
+            "breakout_volume_pass": bool(item.get("breakout_volume_pass")),
+            "pullback_shrink_pass": bool(item.get("pullback_shrink_pass")),
+            "confirm_volume_price_pass": bool(item.get("confirm_volume_price_pass")),
+        }
+    )
+    volume_quality = build_volume_quality_state(item, weights, config["anchored_breakout"]["volume_price_weight"])
+    item.update(volume_quality)
+    item["signal_breakdown"]["volume_quality_pass"] = volume_quality["volume_quality_pass"]
+    score_components["volume_quality_score"] = volume_quality["volume_quality_score"]
+    if item.get("anchored_breakout_signal"):
+        score_components["breakout_score"] += weights.get("anchored_breakout", 0)
+    if item.get("breakout_signal"):
+        score_components["breakout_score"] += weights.get("breakout", 0)
+        item["signal"] = "趋势突破"
+    if item.get("turnaround_signal"):
+        score_components["strategy_score"] += weights.get("turnaround", 0)
+    if item.get("big_order_alert"):
+        score_components["strategy_score"] += weights.get("big_order_alert", 0)
+    if item.get("macd_ignite"):
+        score_components["strategy_score"] += weights.get("macd_ignite", 0)
+    if item.get("anchored_breakout_signal") and item["signal"] == "观察":
+        item["signal"] = "前高突破"
+    finalize_score_components(score_components)
+    item["score_components"] = score_components
+    item["score"] = score_components["final_score"]
+    item["signal_grade"] = get_signal_grade(item["score"], item["is_pullback"], item["risk_notes"], item["is_sector_leader"])
+    item["breakout_price"] = to_float(stock.get("breakout_price") or item.get("anchor_price"))
+    breakout_day = to_int(item.get("anchored_breakout_day"))
+    if breakout_day > 0 and len(df_hist) >= breakout_day and "date" in df_hist:
+        item["breakout_date"] = str(df_hist["date"].iloc[len(df_hist) - breakout_day])
+    item["first_breakout_date"] = stock.get("first_breakout_date") or item.get("breakout_date") or analysis_date
+    item["pool_status"] = build_pool_status(item)
+    item["pool_age_days"] = get_pool_first_breakout_age(item, analysis_date)
+    item["below_ema55_days"] = count_consecutive_below_ema55(df_hist, config)
+    update_signal_breakdown_summary(item)
+    item["summary"] = (
+        f"突破池状态: {format_pool_status(item['pool_status'])}; "
+        f"风险: {'、'.join(item['risk_notes'])}; "
+        f"量价: {item['volume_quality_summary']}; "
+        f"策略: {item['strategy_summary']}"
+    )
+    return item, ""
+
+
+def format_pool_status(status):
+    return {
+        "watch": "突破观察",
+        "tracking": "持续跟踪",
+        "pullback": "回踩候选",
+        "confirm": "确认信号",
+        "removed": "已剔除",
+    }.get(status, status or "-")
+
+
+def get_breakout_pool_remove_reason(item, config):
+    pool_cfg = config["breakout_pool"]
+    breakout_price = to_float(item.get("breakout_price"))
+    price = to_float(item.get("price"))
+    if breakout_price > 0 and price < breakout_price * (1 - pool_cfg["break_below_breakout_pct"]):
+        return f"跌破突破价{pool_cfg['break_below_breakout_pct'] * 100:.0f}%"
+    if item.get("below_ema55_days", 0) >= pool_cfg["ema55_break_days"]:
+        return f"连续{pool_cfg['ema55_break_days']}日跌破EMA55"
+    if item.get("pool_age_days", 0) > pool_cfg["max_watch_days"] and item.get("pool_status") not in {"pullback", "confirm"}:
+        return f"超过{pool_cfg['max_watch_days']}日未形成回踩确认"
+    return ""
+
+
+def get_breakout_pool_keep_rank(item):
+    status_priority = {
+        "confirm": 4,
+        "pullback": 3,
+        "watch": 2,
+        "tracking": 1,
+    }.get(item.get("pool_status"), 0)
+    return (
+        status_priority,
+        to_float(item.get("score")),
+        to_float(item.get("amount")),
+        to_float(item.get("current_price") or item.get("price")),
+    )
+
+
+def prune_breakout_pool_overflow(config, analysis_date):
+    pool_cfg = config["breakout_pool"]
+    active = load_active_breakout_pool()
+    overflow = len(active) - pool_cfg["max_size"]
+    if overflow <= 0:
+        return []
+
+    ranked = sorted(active, key=get_breakout_pool_keep_rank, reverse=True)
+    removed = []
+    for item in ranked[pool_cfg["max_size"] :]:
+        item = dict(item)
+        item["remove_reason"] = "池满末位淘汰"
+        removed.append(item)
+        mark_breakout_pool_removed(item["code"], item["remove_reason"], analysis_date)
+    return removed
+
+
+def collect_breakout_entries_from_scan(scan_diagnostics, analysis_date, config):
+    normalized = normalize_scan_diagnostics(scan_diagnostics)
+    entries = {}
+    max_breakout_day = config["breakout_pool"]["seed_breakout_days"]
+    for item in normalized.get("candidates", []):
+        if not item.get("anchored_breakout_signal"):
+            continue
+        breakout_day = to_int(item.get("anchored_breakout_day"))
+        if breakout_day <= 0 or breakout_day > max_breakout_day:
+            continue
+        code = item.get("code")
+        if not code:
+            continue
+        pool_item = dict(item)
+        pool_item["pool_source"] = "sector_scan"
+        pool_item["pool_status"] = "watch"
+        pool_item["first_breakout_date"] = analysis_date
+        pool_item["breakout_price"] = item.get("anchor_price")
+        entries[code] = pool_item
+    return sorted(entries.values(), key=lambda item: (item.get("score", 0), item.get("amount", 0)), reverse=True)
+
+
+def seed_breakout_pool_from_market(config, analysis_date, use_cache=True, cache_only=False, force=False):
+    pool_cfg = config["breakout_pool"]
+    active_codes = {item["code"] for item in load_active_breakout_pool()}
+    free_slots = max(0, pool_cfg["max_size"] - len(active_codes))
+    add_limit = pool_cfg["max_size"] if force else free_slots
+    if add_limit <= 0 or pool_cfg["full_market_scan_limit"] <= 0:
+        return []
+
+    market_stocks = get_all_market_stocks(use_cache=use_cache, cache_only=cache_only, snapshot_date=analysis_date)
+    seeded = []
+    scanned = 0
+    for stock in market_stocks:
+        if stock["code"] in active_codes:
+            continue
+        if pool_cfg["min_amount"] and to_float(stock.get("amount")) < pool_cfg["min_amount"]:
+            continue
+        scanned += 1
+        if scanned > pool_cfg["full_market_scan_limit"]:
+            break
+        candidate, _ = evaluate_breakout_pool_stock(
+            {**stock, "sector": "全市场"},
+            config,
+            analysis_date,
+            use_cache=use_cache,
+            cache_only=cache_only,
+        )
+        if not candidate:
+            continue
+        breakout_day = to_int(candidate.get("anchored_breakout_day"))
+        if candidate.get("anchored_breakout_signal") and 0 < breakout_day <= pool_cfg["seed_breakout_days"]:
+            candidate["pool_source"] = "full_market_seed"
+            candidate["pool_status"] = "watch"
+            seeded.append(candidate)
+        if len(seeded) >= add_limit:
+            break
+
+    seeded.sort(
+        key=lambda item: (
+            item.get("score", 0),
+            item.get("volume_price_score", 0),
+            item.get("amount", 0),
+        ),
+        reverse=True,
+    )
+    saved = seeded[:add_limit]
+    upsert_breakout_pool_entries(saved, analysis_date)
+    return saved
+
+
+def update_breakout_pool(config, analysis_date, scan_diagnostics, use_cache=True, cache_only=False):
+    if not config.get("breakout_pool", {}).get("enabled", True):
+        return {"enabled": False, "active_count": 0, "new_entries": [], "tracked": [], "removed": [], "stale": []}
+
+    new_entries = collect_breakout_entries_from_scan(scan_diagnostics, analysis_date, config)
+    saved_scan_codes = set(upsert_breakout_pool_entries(new_entries, analysis_date))
+    active_before_seed = load_active_breakout_pool()
+    seeded_entries = []
+    force_seed = bool(config.get("_force_breakout_pool_seed", False))
+    if force_seed or len(active_before_seed) < config["breakout_pool"]["min_size"]:
+        seeded_entries = seed_breakout_pool_from_market(
+            config,
+            analysis_date,
+            use_cache=use_cache,
+            cache_only=cache_only,
+            force=force_seed,
+        )
+
+    tracked = []
+    removed = []
+    stale = []
+    active_pool = load_active_breakout_pool()[: config["breakout_pool"]["track_limit_per_run"]]
+    for entry in active_pool:
+        candidate, reason = evaluate_breakout_pool_stock(
+            entry,
+            config,
+            analysis_date,
+            use_cache=use_cache,
+            cache_only=cache_only,
+        )
+        if not candidate:
+            stale.append({**entry, "update_note": reason or "无法更新"})
+            continue
+        remove_reason = get_breakout_pool_remove_reason(candidate, config)
+        if remove_reason:
+            candidate["remove_reason"] = remove_reason
+            removed.append(candidate)
+            mark_breakout_pool_removed(candidate["code"], remove_reason, analysis_date)
+            continue
+        tracked.append(candidate)
+        upsert_breakout_pool_entries([candidate], analysis_date)
+
+    overflow_removed = prune_breakout_pool_overflow(config, analysis_date)
+    removed.extend(overflow_removed)
+    overflow_codes = {item.get("code") for item in overflow_removed}
+    if overflow_codes:
+        tracked = [item for item in tracked if item.get("code") not in overflow_codes]
+
+    tracked.sort(
+        key=lambda item: (
+            item.get("pool_status") == "confirm",
+            item.get("pool_status") == "pullback",
+            item.get("score", 0),
+            item.get("amount", 0),
+        ),
+        reverse=True,
+    )
+    return {
+        "enabled": True,
+        "active_count": len(load_active_breakout_pool()),
+        "new_entries": [item for item in new_entries if item.get("code") in saved_scan_codes] + seeded_entries,
+        "tracked": tracked,
+        "removed": removed,
+        "stale": stale,
+        "overflow_removed": overflow_removed,
+    }
+
+
+def select_breakout_pool_picks(pool_state, config):
+    if not pool_state or not pool_state.get("enabled"):
+        return []
+    selected = [
+        item
+        for item in pool_state.get("tracked", [])
+        if item.get("pool_status") in {"confirm", "pullback"} or item.get("score", 0) >= config["min_stock_score"]
+    ]
+    selected.sort(
+        key=lambda item: (
+            item.get("pool_status") == "confirm",
+            item.get("pool_status") == "pullback",
+            item.get("score", 0),
+            item.get("amount", 0),
+        ),
+        reverse=True,
+    )
+    result = []
+    for item in selected[: config["breakout_pool"]["pick_limit"]]:
+        item = dict(item)
+        item["sector"] = item.get("sector") or "突破池"
+        item["source_sectors"] = sorted(set(item.get("source_sectors", []) + [item["sector"]]))
+        result.append(strip_internal_stock_fields(item))
+    return result
+
+
 def screen_stocks_in_sector(sector, config, analysis_date, use_cache=True, cache_only=False, scan_diagnostics=None):
     members = get_sector_members(
         sector["name"],
@@ -2775,9 +3445,7 @@ def screen_stocks_in_sector(sector, config, analysis_date, use_cache=True, cache
         else:
             record_scan_candidate(scan_diagnostics, item, "not_selected", "未进入每板块名额")
     for item in result:
-        item.pop("risk_notes", None)
-        item.pop("base_score", None)
-        item.pop("_history", None)
+        strip_internal_stock_fields(item)
     return result
 
 
@@ -3168,6 +3836,7 @@ def build_payload(
     config,
     scan_diagnostics=None,
     edge_candidates=None,
+    breakout_pool=None,
 ):
     normalized_scan = normalize_scan_diagnostics(scan_diagnostics)
     if edge_candidates is None:
@@ -3193,6 +3862,7 @@ def build_payload(
         },
         "stock_candidates": normalized_scan["candidates"] if config.get("export_candidates", True) else [],
         "edge_candidates": edge_candidates,
+        "breakout_pool": breakout_pool or {},
     }
 
 
@@ -3246,10 +3916,12 @@ def format_score_components(item):
 
 def format_config_snapshot(config):
     setup_cfg = config["light_breakout_setup"]
+    pool_cfg = config.get("breakout_pool", {})
     return (
         f"- 最低个股分 {config['min_stock_score']} | RPS阈值 {config['rps_threshold']} | "
         f"RPS最小样本 {config['rps_min_sample']} | 长历史 {config['history_window_days']}天 | "
-        f"轻筛接近前高 {setup_cfg['near_high_pct']:.2f} | 量比阈值 {setup_cfg['min_vol_ratio']:.2f}"
+        f"轻筛接近前高 {setup_cfg['near_high_pct']:.2f} | 量比阈值 {setup_cfg['min_vol_ratio']:.2f} | "
+        f"突破池上限 {pool_cfg.get('max_size', 0)} | 跌破突破价剔除 {pool_cfg.get('break_below_breakout_pct', 0) * 100:.0f}%"
     )
 
 
@@ -3293,6 +3965,7 @@ def generate_report(
     alerts_only=False,
     scan_stats=None,
     edge_candidates=None,
+    breakout_pool=None,
 ):
     if alerts_only:
         return generate_alert_report(date_str, alerts, comparison)
@@ -3367,6 +4040,32 @@ def generate_report(
             lines.append(
                 f"- {stock['name']} {stock['code']} | 评分 {stock.get('score', 0):.2f} | 板块 {'、'.join(stock.get('source_sectors', []))}"
             )
+        lines.append("")
+
+    if breakout_pool and breakout_pool.get("enabled"):
+        tracked = breakout_pool.get("tracked", [])
+        new_entries = breakout_pool.get("new_entries", [])
+        removed = breakout_pool.get("removed", [])
+        stale = breakout_pool.get("stale", [])
+        confirm_count = sum(1 for item in tracked if item.get("pool_status") == "confirm")
+        pullback_count = sum(1 for item in tracked if item.get("pool_status") == "pullback")
+        lines.extend(["突破股票池", "-" * 40])
+        lines.append(
+            f"- 当前池 {breakout_pool.get('active_count', 0)} 只 | 新入池 {len(new_entries)} | 回踩候选 {pullback_count} | 确认信号 {confirm_count} | 今日剔除 {len(removed)} | 未更新 {len(stale)}"
+        )
+        for stock in tracked[: config["breakout_pool"]["pick_limit"]]:
+            status = format_pool_status(stock.get("pool_status"))
+            breakout_price = to_float(stock.get("breakout_price"))
+            breakout_text = f"突破价 {breakout_price:.2f}" if breakout_price > 0 else "突破价 -"
+            lines.append(
+                f"- {stock['name']} {stock['code']} [{stock.get('sector', '突破池')}] | {status} | 评分 {stock.get('score', 0):.2f} | {breakout_text} | 价 {stock.get('price', 0):.2f}"
+            )
+            if stock.get("volume_price_summary"):
+                lines.append(f"  量价 {stock['volume_price_summary']}")
+            if stock.get("signal_breakdown_summary"):
+                lines.append(f"  信号拆解 {stock['signal_breakdown_summary']}")
+        if removed:
+            lines.append("- 剔除: " + "；".join(f"{item.get('name', '-')}{item.get('code', '')}({item.get('remove_reason', '-')})" for item in removed[:5]))
         lines.append("")
 
     lines.extend([f"热门板块 TOP{hot_count}", "-" * 40])
@@ -3514,6 +4213,9 @@ def run_analysis(args):
 
     if args.sector_limit:
         config["_sector_limit"] = max(1, args.sector_limit)
+    config["_force_breakout_pool_seed"] = bool(getattr(args, "update_breakout_pool", False))
+    if config["_force_breakout_pool_seed"]:
+        note("已启用主动突破池更新：本轮会全市场扫描近期突破并尝试入池。")
     if args.diagnose_screening:
         args.skip_backtest = True
         note("当前仅输出筛选诊断，不写入数据库。")
@@ -3587,6 +4289,7 @@ def run_analysis(args):
             return None
 
     backtest = None
+    breakout_pool_state = None
     try:
         all_stock_picks, scan_diagnostics = screen_classified_sectors(
             classified,
@@ -3595,6 +4298,18 @@ def run_analysis(args):
             use_cache=use_cache,
             cache_only=cache_only,
         )
+        breakout_pool_state = update_breakout_pool(
+            config,
+            analysis_date,
+            scan_diagnostics,
+            use_cache=use_cache,
+            cache_only=cache_only,
+        )
+        if breakout_pool_state and breakout_pool_state.get("enabled"):
+            picks_by_code = {item["code"]: item for item in all_stock_picks}
+            for pool_pick in select_breakout_pool_picks(breakout_pool_state, config):
+                merge_stock_pick(picks_by_code, pool_pick)
+            all_stock_picks = sorted(picks_by_code.values(), key=lambda item: item.get("score", 0), reverse=True)
         enrich_stocks_with_concepts(all_stock_picks, concept_member_map, config)
 
         if not args.skip_backtest and (login_needed or cache_only):
@@ -3630,6 +4345,7 @@ def run_analysis(args):
         "alerts_only": args.alerts_only,
         "diagnose_screening": args.diagnose_screening,
         "no_output_files": getattr(args, "no_output_files", False),
+        "update_breakout_pool": getattr(args, "update_breakout_pool", False),
     }
 
     scan_stats = {
@@ -3651,6 +4367,7 @@ def run_analysis(args):
             alerts_only=args.alerts_only,
             scan_stats=scan_stats,
             edge_candidates=edge_candidates,
+            breakout_pool=breakout_pool_state,
         )
     payload = build_payload(
         analysis_date,
@@ -3664,6 +4381,7 @@ def run_analysis(args):
         config,
         scan_diagnostics=scan_diagnostics,
         edge_candidates=edge_candidates,
+        breakout_pool=breakout_pool_state,
     )
 
     if config.get("write_output_files", True) and not getattr(args, "no_output_files", False):
