@@ -88,6 +88,8 @@
     "track_limit_per_run": 100,
     "pick_limit": 10,
     "full_market_scan_limit": 600,
+    "sector_discovery_enabled": true,
+    "sector_discovery_limit_per_run": 200,
     "break_below_breakout_pct": 0.2,
     "ema55_break_days": 2,
     "max_watch_days": 20,

@@ -122,6 +122,8 @@ DEFAULT_CONFIG = {
         "track_limit_per_run": 100,
         "pick_limit": 10,
         "full_market_scan_limit": 600,
+        "sector_discovery_enabled": True,
+        "sector_discovery_limit_per_run": 200,
         "break_below_breakout_pct": 0.20,
         "ema55_break_days": 2,
         "max_watch_days": 20,
@@ -457,6 +459,8 @@ def load_config():
     pool_cfg["track_limit_per_run"] = max(1, int(pool_cfg.get("track_limit_per_run", 100)))
     pool_cfg["pick_limit"] = max(0, int(pool_cfg.get("pick_limit", 10)))
     pool_cfg["full_market_scan_limit"] = max(0, int(pool_cfg.get("full_market_scan_limit", 600)))
+    pool_cfg["sector_discovery_enabled"] = bool(pool_cfg.get("sector_discovery_enabled", True))
+    pool_cfg["sector_discovery_limit_per_run"] = max(0, int(pool_cfg.get("sector_discovery_limit_per_run", 200)))
     pool_cfg["break_below_breakout_pct"] = min(
         0.5,
         max(0.0, float(pool_cfg.get("break_below_breakout_pct", 0.20))),
@@ -630,6 +634,7 @@ def is_sector_data_valid(items):
 
 
 def fetch_with_retry(name, fetcher, cache_name=None, validator=None, sleep_seconds=3, use_cache=True, cache_only=False):
+    last_error = None
     if cache_only:
         if use_cache and cache_name:
             cached = load_cache(cache_name)
@@ -652,6 +657,7 @@ def fetch_with_retry(name, fetcher, cache_name=None, validator=None, sleep_secon
             bump_cache_stat(name, "live")
             return data
         except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
             logger.warning("%s fetch failed (%s/%s): %s", name, attempt, MAX_RETRIES, exc)
             if attempt < MAX_RETRIES:
                 time.sleep(sleep_seconds)
@@ -660,10 +666,14 @@ def fetch_with_retry(name, fetcher, cache_name=None, validator=None, sleep_secon
         cached = load_cache(cache_name)
         if cached:
             record_source(name, "cache", records=len(cached.get("data", [])), cache_name=cache_name)
+            if last_error:
+                note(f"{name} 实时获取失败，已回退缓存；最后错误: {last_error}")
             bump_cache_stat(name, "cache")
             return cached.get("data", [])
 
     record_source(name, "empty", records=0, cache_name=cache_name)
+    if last_error:
+        note(f"{name} 实时获取失败且无可用缓存；最后错误: {last_error}")
     return [] if cache_name else {}
 
 
@@ -1095,24 +1105,27 @@ def get_all_market_stocks(use_cache=True, cache_only=False, snapshot_date=None):
         note("cache-only mode: no cache available for all market stocks")
         return []
 
-    try:
+    def fetch():
         df = ak.stock_zh_a_spot_em()
-    except Exception as exc:  # noqa: BLE001
-        logger.error("get all market stocks failed: %s", exc)
-        return []
+        result = []
+        for _, row in df.iterrows():
+            item = normalize_stock_spot_row(row)
+            if is_tradeable_a_stock(item):
+                result.append(item)
+        return rank_sector_members(result)
 
-    result = []
-    for _, row in df.iterrows():
-        item = normalize_stock_spot_row(row)
-        if is_tradeable_a_stock(item):
-            result.append(item)
-    result = rank_sector_members(result)
-    if use_cache:
-        save_cache(cache_name, {"data": result})
-    runtime_cache_set("all_market_stocks", cache_name, result, enabled=use_cache)
-    bump_cache_stat("all_market_stocks", "live")
-    record_source("all_market_stocks", "live", records=len(result), cache_name=cache_name)
-    return result
+    result = fetch_with_retry(
+        "all_market_stocks",
+        fetch,
+        cache_name=cache_name,
+        validator=lambda items: bool(items),
+        sleep_seconds=2,
+        use_cache=use_cache,
+        cache_only=cache_only,
+    )
+    if not result:
+        note(f"全市场股票列表获取失败，突破池全市场补池本轮跳过；已重试 {MAX_RETRIES} 次。")
+    return runtime_cache_set("all_market_stocks", cache_name, result, enabled=use_cache)
 
 
 def get_sector_members(
@@ -2719,8 +2732,80 @@ def finalize_score_components(components):
 def strip_internal_stock_fields(item):
     item.pop("risk_notes", None)
     item.pop("base_score", None)
-    item.pop("_history", None)
+    for key in list(item):
+        if key.startswith("_"):
+            item.pop(key, None)
     return item
+
+
+def apply_strategy_state_to_candidate(item, df, config):
+    if item.get("_strategy_state_evaluated"):
+        return item
+    strategy_state = build_daily_strategy_state(df, item, config)
+    item.update(strategy_state)
+    item["_strategy_state_evaluated"] = True
+    item.setdefault("signal_breakdown", {}).update(
+        {
+            "anchored_breakout_pass": bool(item.get("anchored_breakout_signal")),
+            "breakout_volume_pass": bool(item.get("breakout_volume_pass")),
+            "pullback_shrink_pass": bool(item.get("pullback_shrink_pass")),
+            "confirm_volume_price_pass": bool(item.get("confirm_volume_price_pass")),
+        }
+    )
+    return item
+
+
+def discover_breakouts_from_sector_candidates(
+    candidates,
+    config,
+    analysis_date,
+    use_cache=True,
+    cache_only=False,
+    scan_diagnostics=None,
+):
+    pool_cfg = config.get("breakout_pool", {})
+    if not pool_cfg.get("enabled", True) or not pool_cfg.get("sector_discovery_enabled", True):
+        return candidates
+
+    limit = pool_cfg.get("sector_discovery_limit_per_run", 0)
+    full_history_days = get_full_history_days(config)
+    discovered = 0
+    checked = 0
+    for item in candidates:
+        if limit and checked >= limit:
+            break
+        if not item.get("breakout_setup_pass"):
+            continue
+        checked += 1
+        bump_scan_count(scan_diagnostics, "stage_counts", "breakout_discovery_checked")
+        full_history = item.get("_history")
+        if not item.get("_full_history_loaded"):
+            full_history = get_stock_history(
+                item["code"],
+                end_date=analysis_date,
+                days=full_history_days,
+                use_cache=use_cache,
+                cache_only=cache_only,
+            )
+            if full_history.empty:
+                bump_scan_count(scan_diagnostics, "reject_reasons", "突破发现长历史缺失")
+                continue
+            item["_history"] = full_history
+            item["_full_history_loaded"] = True
+            item["change_pct"] = round(calc_latest_change_pct(full_history), 2)
+
+        apply_strategy_state_to_candidate(item, item["_history"], config)
+        breakout_day = to_int(item.get("anchored_breakout_day"))
+        if item.get("anchored_breakout_signal") and 0 < breakout_day <= pool_cfg["seed_breakout_days"]:
+            item["pool_source"] = "sector_discovery"
+            item["pool_status"] = "watch"
+            item["breakout_price"] = item.get("anchor_price")
+            record_scan_candidate(scan_diagnostics, item, "breakout_discovered")
+            discovered += 1
+
+    if checked:
+        bump_scan_count(scan_diagnostics, "stage_counts", "breakout_discovery_found", discovered)
+    return candidates
 
 
 def load_active_breakout_pool():
@@ -3324,6 +3409,15 @@ def screen_stocks_in_sector(sector, config, analysis_date, use_cache=True, cache
             }
         )
 
+    discover_breakouts_from_sector_candidates(
+        candidates,
+        config,
+        analysis_date,
+        use_cache=use_cache,
+        cache_only=cache_only,
+        scan_diagnostics=scan_diagnostics,
+    )
+
     apply_sector_rps_metrics(candidates, config)
     light_passed = []
     for item in candidates:
@@ -3344,7 +3438,7 @@ def screen_stocks_in_sector(sector, config, analysis_date, use_cache=True, cache
     volume_price_weight = config["anchored_breakout"]["volume_price_weight"]
     for item in light_passed:
         full_history = item["_history"]
-        if full_history_days > light_history_days:
+        if full_history_days > light_history_days and not item.get("_full_history_loaded"):
             full_history = get_stock_history(
                 item["code"],
                 end_date=analysis_date,
@@ -3356,19 +3450,11 @@ def screen_stocks_in_sector(sector, config, analysis_date, use_cache=True, cache
                 record_scan_candidate(scan_diagnostics, item, "rejected", "长历史缺失")
                 continue
             item["_history"] = full_history
+            item["_full_history_loaded"] = True
             item["change_pct"] = round(calc_latest_change_pct(full_history), 2)
 
         score_components = item.get("score_components", {})
-        strategy_state = build_daily_strategy_state(item["_history"], item, config)
-        item.update(strategy_state)
-        item["signal_breakdown"].update(
-            {
-                "anchored_breakout_pass": bool(item.get("anchored_breakout_signal")),
-                "breakout_volume_pass": bool(item.get("breakout_volume_pass")),
-                "pullback_shrink_pass": bool(item.get("pullback_shrink_pass")),
-                "confirm_volume_price_pass": bool(item.get("confirm_volume_price_pass")),
-            }
-        )
+        apply_strategy_state_to_candidate(item, item["_history"], config)
         volume_quality = build_volume_quality_state(item, weights, volume_price_weight)
         item.update(volume_quality)
         item["signal_breakdown"]["volume_quality_pass"] = volume_quality["volume_quality_pass"]
@@ -3938,7 +4024,7 @@ def generate_screening_diagnostics_report(date_str, scan_stats, edge_candidates)
     reject_reasons = scan_stats.get("reject_reasons", {})
     lines = [f"筛选诊断 | {date_str}", "=" * 40, ""]
     lines.append(
-        f"- 成员 {stage_counts.get('members_seen', 0)} | 扫描 {stage_counts.get('members_scanned', 0)} | 轻筛通过 {stage_counts.get('light_passed', 0)} | 评分通过 {stage_counts.get('score_passed', 0)} | 板块入选 {stage_counts.get('sector_selected', 0)} | 全局入选 {stage_counts.get('global_selected', 0)} | 去重 {stage_counts.get('deduplicated_count', 0)}"
+        f"- 成员 {stage_counts.get('members_seen', 0)} | 扫描 {stage_counts.get('members_scanned', 0)} | 突破发现 {stage_counts.get('breakout_discovery_found', 0)}/{stage_counts.get('breakout_discovery_checked', 0)} | 轻筛通过 {stage_counts.get('light_passed', 0)} | 评分通过 {stage_counts.get('score_passed', 0)} | 板块入选 {stage_counts.get('sector_selected', 0)} | 全局入选 {stage_counts.get('global_selected', 0)} | 去重 {stage_counts.get('deduplicated_count', 0)}"
     )
     if reject_reasons:
         lines.append("")
@@ -4122,7 +4208,7 @@ def generate_report(
         reject_reasons = scan_stats.get("reject_reasons", {})
         lines.extend(["筛选诊断", "-" * 40])
         lines.append(
-            f"- 成员 {stage_counts.get('members_seen', 0)} | 扫描 {stage_counts.get('members_scanned', 0)} | 轻筛通过 {stage_counts.get('light_passed', 0)} | 评分通过 {stage_counts.get('score_passed', 0)} | 板块入选 {stage_counts.get('sector_selected', 0)} | 全局入选 {stage_counts.get('global_selected', 0)} | 去重 {stage_counts.get('deduplicated_count', 0)}"
+            f"- 成员 {stage_counts.get('members_seen', 0)} | 扫描 {stage_counts.get('members_scanned', 0)} | 突破发现 {stage_counts.get('breakout_discovery_found', 0)}/{stage_counts.get('breakout_discovery_checked', 0)} | 轻筛通过 {stage_counts.get('light_passed', 0)} | 评分通过 {stage_counts.get('score_passed', 0)} | 板块入选 {stage_counts.get('sector_selected', 0)} | 全局入选 {stage_counts.get('global_selected', 0)} | 去重 {stage_counts.get('deduplicated_count', 0)}"
         )
         if reject_reasons:
             top_reasons = sorted(reject_reasons.items(), key=lambda item: item[1], reverse=True)[:8]

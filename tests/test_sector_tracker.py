@@ -732,6 +732,94 @@ class SectorTrackerUnitTests(unittest.TestCase):
             st.get_stock_history = original_get_stock_history
             st.analyze_stock_tech = original_analyze_stock_tech
 
+    def test_sector_scan_discovers_breakout_before_final_light_filter(self):
+        original_get_sector_members = st.get_sector_members
+        original_get_stock_history = st.get_stock_history
+        original_analyze_stock_tech = st.analyze_stock_tech
+        original_has_light_breakout_setup = st.has_light_breakout_setup
+        original_build_daily_strategy_state = st.build_daily_strategy_state
+        try:
+            config = st.deep_merge(
+                st.DEFAULT_CONFIG,
+                {
+                    "sector_member_limit": 1,
+                    "stocks_per_sector": 1,
+                    "history_window_days": 321,
+                    "breakout_pool": {"seed_breakout_days": 5, "sector_discovery_enabled": True},
+                },
+            )
+            st.get_sector_members = lambda *args, **kwargs: [
+                {"code": "000001", "name": "Alpha", "price": 10, "pe": 20, "amount": 300, "turnover": 5.0, "change_pct": 2.0},
+            ]
+            st.get_stock_history = lambda *args, **kwargs: pd.DataFrame(
+                [
+                    {"date": "2026-04-13", "open": 9.8, "high": 10.0, "low": 9.6, "close": 10.0, "volume": 100.0, "amount": 1000.0},
+                    {"date": "2026-04-14", "open": 10.1, "high": 10.8, "low": 10.0, "close": 10.6, "volume": 140.0, "amount": 1600.0},
+                ]
+            )
+            st.analyze_stock_tech = lambda df, config: {
+                "price": 10.6,
+                "ema_short": 10.2,
+                "ema_long": 10.0,
+                "ema13": 10.2,
+                "ema55": 10.0,
+                "ema_dist_pct": 0.04,
+                "ema13_dist_pct": 0.04,
+                "ema_bullish": False,
+                "ema13_rising": False,
+                "ema55_rising": False,
+                "ma_bullish": False,
+                "vol_ratio": 1.4,
+                "volatility_10d": 2.0,
+                "change_5d": 2.5,
+                "change_10d": 4.0,
+                "change_50d": 6.0,
+                "change_120d": 8.0,
+                "change_250d": 10.0,
+            }
+            st.has_light_breakout_setup = lambda *args, **kwargs: True
+            st.build_daily_strategy_state = lambda df, stock, config=None: {
+                "ddx": 0.0,
+                "ddx_positive_days_5": 0,
+                "big_order_alert": False,
+                "macd_ignite": False,
+                "turnaround_signal": False,
+                "breakout_signal": False,
+                "stop_profit_line": None,
+                "anchor_price": 10.0,
+                "anchor_date": "2026-04-10",
+                "anchored_breakout_signal": True,
+                "anchored_breakout_day": 3,
+                "breakout_volume_pass": True,
+                "pullback_shrink_pass": False,
+                "confirm_volume_price_pass": False,
+                "volume_price_score": 4,
+                "volume_price_summary": "突破放量",
+                "strategy_tags": ["前高突破"],
+                "strategy_summary": "前高突破",
+            }
+
+            diagnostics = st.build_scan_diagnostics()
+            picks = st.screen_stocks_in_sector(
+                {"name": "Robotics", "type": "industry"},
+                config,
+                "2026-04-14",
+                scan_diagnostics=diagnostics,
+            )
+            normalized = st.normalize_scan_diagnostics(diagnostics)
+            entries = st.collect_breakout_entries_from_scan(diagnostics, "2026-04-14", config)
+
+            self.assertEqual(picks, [])
+            self.assertEqual(normalized["stage_counts"]["breakout_discovered"], 1)
+            self.assertEqual(entries[0]["code"], "000001")
+            self.assertEqual(entries[0]["pool_source"], "sector_scan")
+        finally:
+            st.get_sector_members = original_get_sector_members
+            st.get_stock_history = original_get_stock_history
+            st.analyze_stock_tech = original_analyze_stock_tech
+            st.has_light_breakout_setup = original_has_light_breakout_setup
+            st.build_daily_strategy_state = original_build_daily_strategy_state
+
     def test_light_screen_allows_breakout_setup_when_rps_not_passed(self):
         original_get_sector_members = st.get_sector_members
         original_get_stock_history = st.get_stock_history
