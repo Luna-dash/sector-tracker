@@ -55,17 +55,33 @@ python sector_tracker.py --skip-backtest
 
 - 板块筛选数量、每板块个股数量
 - EMA、MA、RPS 等技术参数
+- 前高突破识别窗口、量价阈值、长历史窗口
 - 板块成员截取、概念匹配、最低分过滤
+- 轻筛突破迹象、边缘候选数量、候选池导出开关
+- RPS 最小样本、风险硬过滤/软扣分、轻筛高位震荡保护
+- 运行期内存缓存、板块扫描间隔
+- 是否写入报告文件
 - 评分权重和风险过滤规则
-- 回测窗口、持有天数、样本下限
+- 回测窗口、持有天数、样本下限、买入价口径
 
-## 策略说明
+JSON 输出会保留 `stock_candidates`、`edge_candidates` 和 `scan_stats`，用于查看完整候选池、轻筛/精筛状态、边缘候选和淘汰原因。
+如果只想看筛选诊断，可以使用：
 
-通达信日线策略整理见：
+```bash
+python sector_tracker.py --diagnose-screening --skip-backtest
+```
 
-`docs/tdx_daily_strategy.md`
+频繁调参时可避免生成报告文件：
 
-当前已接入的是日线可复现部分，盘中逻辑和依赖 Level-2 / 公告明细数据的部分暂未接入。
+```bash
+python sector_tracker.py --no-output-files
+```
+
+## 功能与用法文档
+
+详细功能介绍和用法见：
+
+`docs/README.md`
 
 ## 说明
 

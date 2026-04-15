@@ -2,6 +2,7 @@
 """A-share sector rotation tracker."""
 
 import argparse
+import copy
 import hashlib
 import json
 import logging
@@ -43,8 +44,57 @@ DEFAULT_CONFIG = {
     "rps_threshold": 90,
     "report_time": "17:00",
     "use_cache": True,
+    "runtime_memory_cache": True,
+    "write_output_files": True,
+    "sector_scan_sleep_seconds": 0.0,
     "sector_member_limit": 20,
     "min_stock_score": 55,
+    "history_window_days": 540,
+    "track_candidates": True,
+    "export_candidates": True,
+    "edge_candidates_limit": 10,
+    "edge_candidate_score_gap": 5,
+    "rps_min_sample": 5,
+    "light_breakout_setup": {
+        "near_high_window": 120,
+        "near_high_pct": 0.92,
+        "min_vol_ratio": 1.2,
+        "require_positive_5d": True,
+        "max_change_20d": 25.0,
+        "max_ema55_dist_pct": 0.25,
+        "max_recent_drawdown_pct": 0.18,
+    },
+    "anchored_breakout": {
+        "enabled": True,
+        "breakout_window": 15,
+        "anchor_reference_window": 0,
+        "anchor_min_gap": 16,
+        "pivot_left": 3,
+        "pivot_right": 3,
+        "anchor_zone_pct": 0.03,
+        "absolute_high_near_pct": 0.02,
+        "active_touch_days": 90,
+        "min_pullback_pct": 0.06,
+        "min_base_days": 8,
+        "close_break_buffer_pct": 0.003,
+        "base_below_buffer_pct": 0.005,
+        "volume_confirm_ratio": 1.2,
+        "breakout_amount_ratio20_min": 1.5,
+        "breakout_amount_ratio20_max": 4.0,
+        "breakout_close_position_min": 0.65,
+        "pullback_window": 7,
+        "pullback_amount_vs_breakout_max": 0.65,
+        "pullback_amount_ratio20_max": 1.0,
+        "bad_down_amount_ratio20_min": 1.5,
+        "bad_down_change_pct": -3.0,
+        "confirm_window": 5,
+        "confirm_price_volume_up_days": 2,
+        "confirm_amount_ratio20_min": 1.0,
+        "confirm_amount_ratio20_max": 2.5,
+        "best_breakout_day": 11,
+        "min_breakout_score": 10,
+        "volume_price_weight": 10,
+    },
     "concept_scan_limit": 20,
     "concept_match_limit": 5,
     "concept_overlap_min_count": 2,
@@ -70,6 +120,7 @@ DEFAULT_CONFIG = {
             "rps_four_cycle_red": 15,
             "big_order_alert": 8,
             "macd_ignite": 6,
+            "anchored_breakout": 10,
             "turnaround": 10,
             "breakout": 18,
         },
@@ -81,6 +132,16 @@ DEFAULT_CONFIG = {
         "max_vol_ratio": 2.5,
         "max_volatility_10d": 8.0,
         "strict_mode": False,
+        "hard_filters": {
+            "exclude_negative_pe": False,
+        },
+        "soft_penalties": {
+            "high_pe": 6,
+            "negative_pe": 0,
+            "change_5d": 8,
+            "vol_ratio": 5,
+            "volatility_10d": 5,
+        },
     },
     "backtest": {
         "lookback_days": 30,
@@ -110,7 +171,10 @@ RUNTIME_META = {
     "notes": [],
     "sources": {},
     "cache_stats": defaultdict(lambda: {"live": 0, "cache": 0}),
+    "runtime_memory_cache_enabled": True,
 }
+PRIOR_HIGH_ZONE_CACHE = {}
+RUNTIME_CACHE = {}
 
 
 def ensure_dirs():
@@ -129,6 +193,9 @@ def reset_runtime_meta():
     RUNTIME_META["notes"] = []
     RUNTIME_META["sources"] = {}
     RUNTIME_META["cache_stats"] = defaultdict(lambda: {"live": 0, "cache": 0})
+    RUNTIME_META["runtime_memory_cache_enabled"] = True
+    RUNTIME_CACHE.clear()
+    PRIOR_HIGH_ZONE_CACHE.clear()
 
 
 def get_proxy_environment():
@@ -168,6 +235,16 @@ def deep_merge(base, patch):
     return result
 
 
+def validate_config(config):
+    stock_weights = config.get("score_weights", {}).get("stock", {})
+    negative_weights = [key for key, value in stock_weights.items() if to_float(value) < 0]
+    if negative_weights:
+        raise ValueError(f"stock score weights must be non-negative: {', '.join(negative_weights)}")
+    if config["history_window_days"] < get_light_history_days(config):
+        raise ValueError("history_window_days must cover the light screening window")
+    return config
+
+
 def load_config():
     config = DEFAULT_CONFIG.copy()
     if CONFIG_PATH.exists():
@@ -180,8 +257,17 @@ def load_config():
     config["ema_short"] = max(2, int(config.get("ema_short", 13)))
     config["ema_long"] = max(config["ema_short"] + 1, int(config.get("ema_long", 55)))
     config["pullback_threshold"] = max(0.001, float(config.get("pullback_threshold", 0.015)))
+    config["runtime_memory_cache"] = bool(config.get("runtime_memory_cache", True))
+    config["write_output_files"] = bool(config.get("write_output_files", True))
+    config["sector_scan_sleep_seconds"] = min(5.0, max(0.0, float(config.get("sector_scan_sleep_seconds", 0.0))))
     config["sector_member_limit"] = max(5, int(config.get("sector_member_limit", 20)))
     config["min_stock_score"] = max(0, float(config.get("min_stock_score", 55)))
+    config["history_window_days"] = max(260, int(config.get("history_window_days", 540)))
+    config["track_candidates"] = bool(config.get("track_candidates", True))
+    config["export_candidates"] = bool(config.get("export_candidates", True))
+    config["edge_candidates_limit"] = max(0, int(config.get("edge_candidates_limit", 10)))
+    config["edge_candidate_score_gap"] = max(0.0, float(config.get("edge_candidate_score_gap", 5)))
+    config["rps_min_sample"] = max(1, int(config.get("rps_min_sample", 5)))
     config["concept_scan_limit"] = max(5, int(config.get("concept_scan_limit", 20)))
     config["concept_match_limit"] = max(1, int(config.get("concept_match_limit", 5)))
     config["concept_overlap_min_count"] = max(1, int(config.get("concept_overlap_min_count", 2)))
@@ -219,6 +305,116 @@ def load_config():
     config["rps_periods"] = normalized_rps_periods or [10, 20, 50, 120, 250]
     config["rps_threshold"] = min(100.0, max(0.0, float(config.get("rps_threshold", 90))))
 
+    light_breakout_cfg = deep_merge(DEFAULT_CONFIG.get("light_breakout_setup", {}), config.get("light_breakout_setup", {}))
+    light_breakout_cfg["near_high_window"] = max(20, int(light_breakout_cfg.get("near_high_window", 120)))
+    light_breakout_cfg["near_high_pct"] = min(
+        1.0,
+        max(0.5, float(light_breakout_cfg.get("near_high_pct", 0.92))),
+    )
+    light_breakout_cfg["min_vol_ratio"] = max(0.5, float(light_breakout_cfg.get("min_vol_ratio", 1.2)))
+    light_breakout_cfg["require_positive_5d"] = bool(light_breakout_cfg.get("require_positive_5d", True))
+    light_breakout_cfg["max_change_20d"] = max(0.0, float(light_breakout_cfg.get("max_change_20d", 25.0)))
+    light_breakout_cfg["max_ema55_dist_pct"] = max(0.0, float(light_breakout_cfg.get("max_ema55_dist_pct", 0.25)))
+    light_breakout_cfg["max_recent_drawdown_pct"] = max(0.0, float(light_breakout_cfg.get("max_recent_drawdown_pct", 0.18)))
+    config["light_breakout_setup"] = light_breakout_cfg
+
+    breakout_cfg = deep_merge(DEFAULT_CONFIG.get("anchored_breakout", {}), config.get("anchored_breakout", {}))
+    breakout_cfg["enabled"] = bool(breakout_cfg.get("enabled", True))
+    breakout_cfg["breakout_window"] = max(5, int(breakout_cfg.get("breakout_window", 15)))
+    breakout_cfg["anchor_reference_window"] = max(0, int(breakout_cfg.get("anchor_reference_window", 0)))
+    breakout_cfg["pivot_left"] = max(1, int(breakout_cfg.get("pivot_left", 3)))
+    breakout_cfg["pivot_right"] = max(1, int(breakout_cfg.get("pivot_right", 3)))
+    breakout_cfg["anchor_zone_pct"] = min(0.08, max(0.005, float(breakout_cfg.get("anchor_zone_pct", 0.03))))
+    breakout_cfg["absolute_high_near_pct"] = min(
+        0.08,
+        max(0.005, float(breakout_cfg.get("absolute_high_near_pct", 0.02))),
+    )
+    breakout_cfg["active_touch_days"] = max(20, int(breakout_cfg.get("active_touch_days", 90)))
+    breakout_cfg["anchor_min_gap"] = max(
+        breakout_cfg["pivot_right"],
+        int(breakout_cfg.get("anchor_min_gap", breakout_cfg["breakout_window"] + 1)),
+    )
+    breakout_cfg["min_pullback_pct"] = min(0.3, max(0.01, float(breakout_cfg.get("min_pullback_pct", 0.06))))
+    breakout_cfg["min_base_days"] = max(3, int(breakout_cfg.get("min_base_days", 8)))
+    breakout_cfg["close_break_buffer_pct"] = min(
+        0.03,
+        max(0.0, float(breakout_cfg.get("close_break_buffer_pct", 0.003))),
+    )
+    breakout_cfg["base_below_buffer_pct"] = min(
+        0.05,
+        max(0.0, float(breakout_cfg.get("base_below_buffer_pct", 0.005))),
+    )
+    breakout_cfg["volume_confirm_ratio"] = min(
+        5.0,
+        max(0.8, float(breakout_cfg.get("volume_confirm_ratio", 1.2))),
+    )
+    breakout_cfg["breakout_amount_ratio20_min"] = min(
+        5.0,
+        max(0.5, float(breakout_cfg.get("breakout_amount_ratio20_min", 1.5))),
+    )
+    breakout_cfg["breakout_amount_ratio20_max"] = min(
+        10.0,
+        max(
+            breakout_cfg["breakout_amount_ratio20_min"],
+            float(breakout_cfg.get("breakout_amount_ratio20_max", 4.0)),
+        ),
+    )
+    breakout_cfg["breakout_close_position_min"] = min(
+        1.0,
+        max(0.0, float(breakout_cfg.get("breakout_close_position_min", 0.65))),
+    )
+    breakout_cfg["pullback_window"] = max(1, int(breakout_cfg.get("pullback_window", 7)))
+    breakout_cfg["pullback_amount_vs_breakout_max"] = min(
+        1.5,
+        max(0.1, float(breakout_cfg.get("pullback_amount_vs_breakout_max", 0.65))),
+    )
+    breakout_cfg["pullback_amount_ratio20_max"] = min(
+        2.0,
+        max(0.1, float(breakout_cfg.get("pullback_amount_ratio20_max", 1.0))),
+    )
+    breakout_cfg["bad_down_amount_ratio20_min"] = min(
+        5.0,
+        max(0.5, float(breakout_cfg.get("bad_down_amount_ratio20_min", 1.5))),
+    )
+    breakout_cfg["bad_down_change_pct"] = min(
+        0.0,
+        float(breakout_cfg.get("bad_down_change_pct", -3.0)),
+    )
+    breakout_cfg["confirm_window"] = max(1, int(breakout_cfg.get("confirm_window", 5)))
+    breakout_cfg["confirm_price_volume_up_days"] = max(
+        1,
+        int(breakout_cfg.get("confirm_price_volume_up_days", 2)),
+    )
+    breakout_cfg["confirm_amount_ratio20_min"] = min(
+        5.0,
+        max(0.1, float(breakout_cfg.get("confirm_amount_ratio20_min", 1.0))),
+    )
+    breakout_cfg["confirm_amount_ratio20_max"] = min(
+        8.0,
+        max(
+            breakout_cfg["confirm_amount_ratio20_min"],
+            float(breakout_cfg.get("confirm_amount_ratio20_max", 2.5)),
+        ),
+    )
+    breakout_cfg["best_breakout_day"] = max(1, int(breakout_cfg.get("best_breakout_day", 11)))
+    breakout_cfg["min_breakout_score"] = max(0, float(breakout_cfg.get("min_breakout_score", 10)))
+    breakout_cfg["volume_price_weight"] = max(0.0, float(breakout_cfg.get("volume_price_weight", 10)))
+    config["anchored_breakout"] = breakout_cfg
+
+    risk_cfg = deep_merge(DEFAULT_CONFIG.get("risk_filters", {}), config.get("risk_filters", {}))
+    risk_cfg["high_pe_warning"] = float(risk_cfg.get("high_pe_warning", 100))
+    risk_cfg["exclude_negative_pe"] = bool(risk_cfg.get("exclude_negative_pe", False))
+    risk_cfg["max_change_5d"] = max(0.0, float(risk_cfg.get("max_change_5d", 12.0)))
+    risk_cfg["max_vol_ratio"] = max(0.0, float(risk_cfg.get("max_vol_ratio", 2.5)))
+    risk_cfg["max_volatility_10d"] = max(0.0, float(risk_cfg.get("max_volatility_10d", 8.0)))
+    risk_cfg["strict_mode"] = bool(risk_cfg.get("strict_mode", False))
+    hard_filters = deep_merge(DEFAULT_CONFIG["risk_filters"].get("hard_filters", {}), risk_cfg.get("hard_filters", {}))
+    hard_filters["exclude_negative_pe"] = bool(hard_filters.get("exclude_negative_pe", risk_cfg["exclude_negative_pe"]))
+    soft_penalties = deep_merge(DEFAULT_CONFIG["risk_filters"].get("soft_penalties", {}), risk_cfg.get("soft_penalties", {}))
+    risk_cfg["hard_filters"] = hard_filters
+    risk_cfg["soft_penalties"] = {key: max(0.0, float(value)) for key, value in soft_penalties.items()}
+    config["risk_filters"] = risk_cfg
+
     backtest_cfg = config.get("backtest", {})
     holding_days = backtest_cfg.get("holding_days", [1, 3, 5])
     if not isinstance(holding_days, list) or not holding_days:
@@ -227,11 +423,11 @@ def load_config():
     backtest_cfg["lookback_days"] = max(1, int(backtest_cfg.get("lookback_days", 30)))
     backtest_cfg["min_samples"] = max(1, int(backtest_cfg.get("min_samples", 5)))
     entry_price_basis = str(backtest_cfg.get("entry_price_basis", "signal_close")).strip().lower()
-    if entry_price_basis != "signal_close":
+    if entry_price_basis not in {"signal_close", "next_open"}:
         entry_price_basis = "signal_close"
     backtest_cfg["entry_price_basis"] = entry_price_basis
     config["backtest"] = backtest_cfg
-    return config
+    return validate_config(config)
 
 
 def parse_args():
@@ -247,7 +443,9 @@ def parse_args():
     parser.add_argument("--min-score", type=float, default=None, help="minimum stock score threshold")
     parser.add_argument("--exclude-high-pe", action="store_true", help="exclude picks over high PE warning line")
     parser.add_argument("--alerts-only", action="store_true", help="only output alert summary")
+    parser.add_argument("--diagnose-screening", action="store_true", help="only output screening diagnostics")
     parser.add_argument("--output-json", help="custom json output path")
+    parser.add_argument("--no-output-files", action="store_true", help="skip writing markdown/json report files")
     parser.add_argument("--skip-backtest", action="store_true", help="skip backtest summary")
     return parser.parse_args()
 
@@ -280,7 +478,7 @@ def calc_latest_change_pct(df):
     return (latest_close - prev_close) / prev_close * 100
 
 
-def resolve_signal_entry(history, signal_date):
+def resolve_signal_entry(history, signal_date, entry_price_basis="signal_close"):
     if history.empty or "date" not in history.columns or "close" not in history.columns:
         return None, None
     history = history.reset_index(drop=True)
@@ -289,16 +487,47 @@ def resolve_signal_entry(history, signal_date):
     except IndexError:
         return None, None
 
-    entry_price = to_float(history.iloc[signal_index]["close"], 0.0)
+    if entry_price_basis == "next_open":
+        if "open" not in history.columns:
+            return None, None
+        entry_index = signal_index + 1
+        if entry_index >= len(history):
+            return None, None
+        entry_price = to_float(history.iloc[entry_index]["open"], 0.0)
+    else:
+        entry_index = signal_index
+        entry_price = to_float(history.iloc[entry_index]["close"], 0.0)
     if entry_price <= 0:
         return None, None
-    return signal_index, entry_price
+    return entry_index, entry_price
 
 
 def json_default(value):
     if isinstance(value, (datetime, pd.Timestamp)):
         return value.strftime("%Y-%m-%d")
     raise TypeError(f"Unsupported type: {type(value)!r}")
+
+
+def clone_runtime_value(value):
+    if isinstance(value, pd.DataFrame):
+        return value.copy()
+    return copy.deepcopy(value)
+
+
+def runtime_cache_get(namespace, key, enabled=True):
+    if not enabled or not RUNTIME_META.get("runtime_memory_cache_enabled", True):
+        return None
+    value = RUNTIME_CACHE.get((namespace, key))
+    if value is None:
+        return None
+    return clone_runtime_value(value)
+
+
+def runtime_cache_set(namespace, key, value, enabled=True):
+    if not enabled or not RUNTIME_META.get("runtime_memory_cache_enabled", True):
+        return value
+    RUNTIME_CACHE[(namespace, key)] = clone_runtime_value(value)
+    return value
 
 
 def cache_key(*parts):
@@ -761,11 +990,15 @@ def get_sector_members(
         allow_live = snapshot_date == datetime.now().strftime("%Y-%m-%d")
     hashed = cache_key("members", sector_type, sector_name, snapshot_key)
     cache_name = f"members_{hashed}"
+    memory_cached = runtime_cache_get("sector_members", cache_name, enabled=use_cache)
+    if memory_cached is not None:
+        bump_cache_stat("sector_members", "memory")
+        return memory_cached
     if use_cache:
         cached = load_cache(cache_name)
         if cached:
             bump_cache_stat("sector_members", "cache")
-            return cached.get("data", [])
+            return runtime_cache_set("sector_members", cache_name, cached.get("data", []), enabled=use_cache)
     if cache_only:
         note(f"cache-only mode: no cache available for sector members {sector_type}:{sector_name}")
         return []
@@ -799,6 +1032,7 @@ def get_sector_members(
         )
     if use_cache:
         save_cache(cache_name, {"data": result})
+    runtime_cache_set("sector_members", cache_name, result, enabled=use_cache)
     bump_cache_stat("sector_members", "live")
     return result
 
@@ -837,11 +1071,16 @@ def get_stock_history(code, end_date=None, days=120, use_cache=True, cache_only=
     end_date = end_date or datetime.now().strftime("%Y-%m-%d")
     hashed = cache_key("history", code, end_date, days)
     cache_name = f"history_{hashed}"
+    memory_cached = runtime_cache_get("stock_history", cache_name, enabled=use_cache)
+    if memory_cached is not None:
+        bump_cache_stat("stock_history", "memory")
+        return memory_cached
     if use_cache:
         cached = load_cache(cache_name)
         if cached:
             bump_cache_stat("stock_history", "cache")
-            return pd.DataFrame(cached.get("data", []))
+            df_cached = pd.DataFrame(cached.get("data", []))
+            return runtime_cache_set("stock_history", cache_name, df_cached, enabled=use_cache).copy()
     if cache_only:
         note(f"cache-only mode: no cache available for stock history {code}")
         return pd.DataFrame()
@@ -868,6 +1107,7 @@ def get_stock_history(code, end_date=None, days=120, use_cache=True, cache_only=
         df = df.dropna(subset=["close"]).reset_index(drop=True)
         if use_cache:
             save_cache(cache_name, {"data": df.to_dict("records")})
+        runtime_cache_set("stock_history", cache_name, df, enabled=use_cache)
         bump_cache_stat("stock_history", "live")
         return df
     except Exception as exc:  # noqa: BLE001
@@ -879,11 +1119,16 @@ def get_benchmark_history(name, bs_code, end_date=None, days=120, use_cache=True
     end_date = end_date or datetime.now().strftime("%Y-%m-%d")
     hashed = cache_key("benchmark", name, bs_code, end_date, days)
     cache_name = f"benchmark_{hashed}"
+    memory_cached = runtime_cache_get("benchmark_history", cache_name, enabled=use_cache)
+    if memory_cached is not None:
+        bump_cache_stat("benchmark_history", "memory")
+        return memory_cached
     if use_cache:
         cached = load_cache(cache_name)
         if cached:
             bump_cache_stat("benchmark_history", "cache")
-            return pd.DataFrame(cached.get("data", []))
+            df_cached = pd.DataFrame(cached.get("data", []))
+            return runtime_cache_set("benchmark_history", cache_name, df_cached, enabled=use_cache).copy()
     if cache_only:
         note(f"cache-only mode: no cache available for benchmark {name}")
         return pd.DataFrame()
@@ -892,7 +1137,7 @@ def get_benchmark_history(name, bs_code, end_date=None, days=120, use_cache=True
         start_date = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days + 30)).strftime("%Y-%m-%d")
         rs = bs.query_history_k_data_plus(
             bs_code,
-            "date,close",
+            "date,open,close",
             start_date=start_date,
             end_date=end_date,
             frequency="d",
@@ -904,10 +1149,12 @@ def get_benchmark_history(name, bs_code, end_date=None, days=120, use_cache=True
         if not rows:
             return pd.DataFrame()
         df = pd.DataFrame(rows, columns=rs.fields)
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        for column in ("open", "close"):
+            df[column] = pd.to_numeric(df[column], errors="coerce")
         df = df.dropna(subset=["close"]).reset_index(drop=True)
         if use_cache:
             save_cache(cache_name, {"data": df.to_dict("records")})
+        runtime_cache_set("benchmark_history", cache_name, df, enabled=use_cache)
         bump_cache_stat("benchmark_history", "live")
         return df
     except Exception as exc:  # noqa: BLE001
@@ -940,6 +1187,571 @@ def crossed_above(left, right):
     if len(left) < 2 or len(right) < 2:
         return False
     return left.iloc[-2] <= right.iloc[-2] and left.iloc[-1] > right.iloc[-1]
+
+
+def empty_anchored_breakout_state():
+    return {
+        "anchor_found": False,
+        "anchor_type": None,
+        "anchor_price": None,
+        "anchor_date": None,
+        "anchor_days_ago": None,
+        "anchor_latest_touch_date": None,
+        "anchor_latest_touch_days_ago": None,
+        "anchor_zone_touches": 0,
+        "anchor_visibility_score": 0.0,
+        "anchor_pullback_pct": 0.0,
+        "anchor_base_days": 0,
+        "anchored_breakout_signal": False,
+        "anchored_breakout_score": 0.0,
+        "anchored_breakout_day": None,
+        "anchored_breakout_volume_ratio": 0.0,
+        "breakout_amount_ratio20": 0.0,
+        "breakout_close_position": 0.0,
+        "pullback_amount_ratio20": 0.0,
+        "pullback_amount_vs_breakout": 0.0,
+        "pullback_volume_score": 0.0,
+        "bad_volume_down_day": False,
+        "confirm_price_volume_up_days": 0,
+        "confirm_amount_ratio20": 0.0,
+        "volume_price_score": 0.0,
+        "anchored_shape_score": 0.0,
+        "anchored_volume_score": 0.0,
+        "anchored_shape_grade": "D",
+        "anchored_breakout_grade": "",
+        "breakout_volume_pass": False,
+        "pullback_shrink_pass": False,
+        "confirm_volume_price_pass": False,
+        "volume_price_summary": "",
+    }
+
+
+def get_anchor_type_label(anchor_type):
+    mapping = {
+        "absolute_high": "绝对高点",
+        "resistance_zone": "阻力区",
+        "swing_high": "摆动高点",
+    }
+    return mapping.get(anchor_type, anchor_type or "-")
+
+
+def safe_series_ratio(numerator, denominator):
+    result = numerator.astype(float) / denominator.replace(0, pd.NA).astype(float)
+    return result.fillna(0.0)
+
+
+def calc_close_position(close, high, low):
+    price_range = (high - low).replace(0, pd.NA)
+    return ((close - low) / price_range).fillna(0.5).clip(lower=0.0, upper=1.0)
+
+
+def is_pivot_high(series, index, left, right):
+    if index - left < 0 or index + right >= len(series):
+        return False
+    center = series.iloc[index]
+    if pd.isna(center):
+        return False
+    left_max = series.iloc[index - left : index].max()
+    right_max = series.iloc[index + 1 : index + 1 + right].max()
+    return bool(center >= left_max and center >= right_max and (center > left_max or center > right_max))
+
+
+def build_prior_high_zones(df, config):
+    settings = config.get("anchored_breakout", {})
+    breakout_window = settings["breakout_window"]
+    reference_window = settings["anchor_reference_window"]
+    min_gap = settings["anchor_min_gap"]
+    left = settings["pivot_left"]
+    right = settings["pivot_right"]
+    zone_pct = settings["anchor_zone_pct"]
+    absolute_high_near_pct = settings["absolute_high_near_pct"]
+    min_pullback_pct = settings["min_pullback_pct"]
+    min_base_days = settings["min_base_days"]
+    base_below_buffer_pct = settings["base_below_buffer_pct"]
+
+    min_history = max(60, breakout_window + min_gap + right * 4)
+    if df.empty or len(df) < min_history:
+        return None
+
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    dates = df["date"] if "date" in df else None
+    last_index = len(df) - 1
+    breakout_start = max(0, len(df) - breakout_window)
+    reference_end = breakout_start - 1
+    if reference_end <= 0:
+        return None
+    if reference_window > 0:
+        reference_start = max(0, reference_end - reference_window + 1)
+    else:
+        reference_start = 0
+
+    candidates = []
+    for idx in range(reference_start, reference_end + 1):
+        if last_index - idx < min_gap:
+            continue
+
+        pivot_scale = 0
+        for multiplier in (1, 2, 4):
+            scale_left = left * multiplier
+            scale_right = right * multiplier
+            if idx - scale_left < reference_start or idx + scale_right > reference_end:
+                continue
+            if is_pivot_high(high, idx, scale_left, scale_right):
+                pivot_scale = multiplier
+        if pivot_scale <= 0:
+            continue
+
+        anchor_price = float(high.iloc[idx])
+        post_close = close.iloc[idx + 1 : breakout_start]
+        post_low = low.iloc[idx + 1 : breakout_start]
+        if post_close.empty or post_low.empty or anchor_price <= 0:
+            continue
+
+        pullback_pct = float((anchor_price - float(post_low.min())) / anchor_price)
+        base_days = int((post_close <= anchor_price * (1 - base_below_buffer_pct)).sum())
+        if pullback_pct < min_pullback_pct and base_days < min_base_days:
+            continue
+
+        candidates.append(
+            {
+                "index": idx,
+                "price": anchor_price,
+                "date": str(dates.iloc[idx]) if dates is not None else None,
+                "days_ago": last_index - idx,
+                "pullback_pct": round(pullback_pct * 100, 2),
+                "base_days": base_days,
+                "pivot_scale": pivot_scale,
+            }
+        )
+
+    if not candidates:
+        return None
+
+    pre_breakout_high = float(high.iloc[reference_start : reference_end + 1].max())
+    zones = []
+    for candidate in sorted(candidates, key=lambda item: item["price"], reverse=True):
+        matched_zone = None
+        for zone in zones:
+            zone_top = zone["top_price"]
+            if abs(candidate["price"] - zone_top) / max(candidate["price"], zone_top) <= zone_pct:
+                matched_zone = zone
+                break
+        if matched_zone is None:
+            matched_zone = {
+                "top_price": candidate["price"],
+                "members": [],
+            }
+            zones.append(matched_zone)
+        matched_zone["members"].append(candidate)
+        matched_zone["top_price"] = max(matched_zone["top_price"], candidate["price"])
+
+    scored_zones = []
+    for zone in zones:
+        members = zone["members"]
+        highest_member = max(members, key=lambda item: (item["price"], item["index"]))
+        latest_member = max(members, key=lambda item: item["index"])
+        touches = len(members)
+        max_pullback_pct = max(item["pullback_pct"] for item in members)
+        max_base_days = max(item["base_days"] for item in members)
+        max_pivot_scale = max(item["pivot_scale"] for item in members)
+        price_rank = zone["top_price"] / pre_breakout_high if pre_breakout_high > 0 else 0.0
+        recency_norm = 1 - min(latest_member["days_ago"], 360) / 360
+        touch_norm = min(touches, 4) / 4
+        prominence_norm = min((max_pullback_pct / 100) / max(min_pullback_pct, 0.01), 2.0) / 2.0
+        scale_norm = min(max_pivot_scale, 4) / 4
+        is_recent_absolute_high = bool(price_rank >= 1 - absolute_high_near_pct)
+        visibility_score = (
+            30 * price_rank
+            + 25 * recency_norm
+            + 20 * touch_norm
+            + 15 * prominence_norm
+            + 10 * scale_norm
+            + (10 if is_recent_absolute_high else 0)
+        )
+        anchor_type = "absolute_high" if is_recent_absolute_high else "resistance_zone" if touches >= 2 else "swing_high"
+        scored_zones.append(
+            {
+                "index": highest_member["index"],
+                "price": round(zone["top_price"], 2),
+                "date": highest_member["date"],
+                "days_ago": highest_member["days_ago"],
+                "latest_touch_date": latest_member["date"],
+                "latest_touch_days_ago": latest_member["days_ago"],
+                "pullback_pct": round(max_pullback_pct, 2),
+                "base_days": max_base_days,
+                "touches": touches,
+                "pivot_scale": max_pivot_scale,
+                "anchor_type": anchor_type,
+                "visibility_score": round(visibility_score, 2),
+                "is_recent_absolute_high": is_recent_absolute_high,
+            }
+        )
+
+    return scored_zones
+
+
+def build_prior_high_cache_key(df, config, cache_key_id):
+    if not cache_key_id or df.empty:
+        return None
+    settings = config.get("anchored_breakout", {})
+    last_date = str(df["date"].iloc[-1]) if "date" in df else str(len(df))
+    key_fields = (
+        settings.get("breakout_window"),
+        settings.get("anchor_reference_window"),
+        settings.get("anchor_min_gap"),
+        settings.get("pivot_left"),
+        settings.get("pivot_right"),
+        settings.get("anchor_zone_pct"),
+        settings.get("absolute_high_near_pct"),
+        settings.get("min_pullback_pct"),
+        settings.get("min_base_days"),
+        settings.get("base_below_buffer_pct"),
+    )
+    return (str(cache_key_id), last_date, len(df), key_fields)
+
+
+def get_prior_high_zones(df, config, cache_key_id=None):
+    cache_key_value = build_prior_high_cache_key(df, config, cache_key_id)
+    if cache_key_value is not None and cache_key_value in PRIOR_HIGH_ZONE_CACHE:
+        cached = PRIOR_HIGH_ZONE_CACHE[cache_key_value]
+        return [dict(item) for item in cached] if cached else None
+
+    zones = build_prior_high_zones(df, config)
+    if cache_key_value is not None:
+        PRIOR_HIGH_ZONE_CACHE[cache_key_value] = [dict(item) for item in zones] if zones else None
+    return zones
+
+
+def find_prior_high_anchor(df, config, scored_zones=None):
+    settings = config.get("anchored_breakout", {})
+    if scored_zones is None:
+        scored_zones = build_prior_high_zones(df, config)
+    if not scored_zones:
+        return None
+
+    active_touch_days = settings["active_touch_days"]
+    preferred_zones = [item for item in scored_zones if item["latest_touch_days_ago"] <= active_touch_days] or scored_zones
+    return max(
+        preferred_zones,
+        key=lambda item: (
+            item["visibility_score"],
+            item["latest_touch_days_ago"] * -1,
+            item["price"],
+            item["touches"],
+        ),
+    )
+
+
+def apply_anchor_state(state, anchor):
+    state.update(
+        {
+            "anchor_found": True,
+            "anchor_type": anchor.get("anchor_type"),
+            "anchor_price": round(anchor["price"], 2),
+            "anchor_date": anchor["date"],
+            "anchor_days_ago": anchor["days_ago"],
+            "anchor_latest_touch_date": anchor.get("latest_touch_date"),
+            "anchor_latest_touch_days_ago": anchor.get("latest_touch_days_ago"),
+            "anchor_zone_touches": int(anchor.get("touches", 1)),
+            "anchor_visibility_score": round(float(anchor.get("visibility_score", 0.0)), 2),
+            "anchor_pullback_pct": anchor["pullback_pct"],
+            "anchor_base_days": anchor["base_days"],
+        }
+    )
+
+
+def build_breakout_context(df):
+    close = df["close"].astype(float)
+    open_ = df["open"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    volume = df["volume"].astype(float)
+    amount = df["amount"].astype(float) if "amount" in df else pd.Series(0.0, index=df.index, dtype="float64")
+    return {
+        "close": close,
+        "open": open_,
+        "high": high,
+        "low": low,
+        "volume": volume,
+        "amount": amount,
+        "volume_ma5": calc_ma(volume, 5),
+        "amount_ma5": calc_ma(amount, 5),
+        "amount_ratio20": safe_series_ratio(amount, calc_ma(amount, 20)),
+        "close_position": calc_close_position(close, high, low),
+        "daily_change_pct": close.pct_change().fillna(0.0) * 100,
+    }
+
+
+def find_breakout_index(zone, context, settings, breakout_start, history_length):
+    close = context["close"]
+    volume = context["volume"]
+    amount = context["amount"]
+    volume_ma5 = context["volume_ma5"]
+    amount_ma5 = context["amount_ma5"]
+    threshold = zone["price"] * (1 + settings["close_break_buffer_pct"])
+    for idx in range(breakout_start, history_length):
+        prev_close = close.iloc[idx - 1] if idx > 0 else close.iloc[idx]
+        if close.iloc[idx] <= threshold or prev_close > threshold:
+            continue
+
+        volume_base = volume_ma5.iloc[idx]
+        amount_base = amount_ma5.iloc[idx]
+        volume_ratio = float(volume.iloc[idx] / volume_base) if volume_base and not pd.isna(volume_base) else 0.0
+        amount_ratio = float(amount.iloc[idx] / amount_base) if amount_base and not pd.isna(amount_base) else 0.0
+        return idx, max(volume_ratio, amount_ratio)
+    return None, 0.0
+
+
+def score_breakout_day(breakout_index, history_length, settings):
+    breakout_day = history_length - breakout_index
+    best_day = settings["best_breakout_day"]
+    breakout_score = 50 - 8 * max(0, breakout_day - best_day) - 5 * max(0, best_day - breakout_day)
+    return breakout_day, max(0.0, float(breakout_score))
+
+
+def evaluate_breakout_day_quality(breakout_index, breakout_volume_ratio, context, settings):
+    breakout_amount_ratio20 = float(context["amount_ratio20"].iloc[breakout_index])
+    breakout_close_position = float(context["close_position"].iloc[breakout_index])
+    breakout_volume_pass = breakout_volume_ratio >= settings["volume_confirm_ratio"]
+    breakout_amount_pass = (
+        breakout_amount_ratio20 >= settings["breakout_amount_ratio20_min"]
+        and breakout_amount_ratio20 <= settings["breakout_amount_ratio20_max"]
+    )
+    close_position_pass = breakout_close_position >= settings["breakout_close_position_min"]
+    return {
+        "breakout_amount_ratio20": breakout_amount_ratio20,
+        "breakout_close_position": breakout_close_position,
+        "breakout_volume_pass": bool(breakout_volume_pass and breakout_amount_pass and close_position_pass),
+    }
+
+
+def evaluate_pullback_quality(breakout_index, context, settings, history_length):
+    post_start = breakout_index + 1
+    post_end = min(history_length, breakout_index + settings["pullback_window"] + 1)
+    result = {
+        "pullback_amount_ratio20": 0.0,
+        "pullback_amount_vs_breakout": 0.0,
+        "pullback_volume_score": 0.0,
+        "pullback_shrink_pass": False,
+    }
+    if post_start >= post_end:
+        return result
+
+    pullback_lows = context["low"].iloc[post_start:post_end].reset_index(drop=True)
+    pullback_index = post_start + int(pullback_lows.idxmin())
+    breakout_amount = float(context["amount"].iloc[breakout_index])
+    pullback_amount = float(context["amount"].iloc[pullback_index])
+    pullback_amount_vs_breakout = pullback_amount / breakout_amount if breakout_amount > 0 else 0.0
+    pullback_amount_ratio20 = float(context["amount_ratio20"].iloc[pullback_index])
+    pullback_shrink_pass = (
+        pullback_amount_vs_breakout <= settings["pullback_amount_vs_breakout_max"]
+        and pullback_amount_ratio20 <= settings["pullback_amount_ratio20_max"]
+    )
+    result.update(
+        {
+            "pullback_amount_ratio20": pullback_amount_ratio20,
+            "pullback_amount_vs_breakout": pullback_amount_vs_breakout,
+            "pullback_volume_score": round(10 * max(0.0, 1 - pullback_amount_vs_breakout), 2) if pullback_shrink_pass else 0.0,
+            "pullback_shrink_pass": bool(pullback_shrink_pass),
+        }
+    )
+    return result
+
+
+def has_bad_volume_down_day(breakout_index, context, settings, history_length):
+    post_slice_start = breakout_index + 1
+    if post_slice_start >= history_length:
+        return False
+    post_slice = slice(post_slice_start, history_length)
+    return bool(
+        (
+            (context["close"].iloc[post_slice] < context["open"].iloc[post_slice])
+            & (context["daily_change_pct"].iloc[post_slice] <= settings["bad_down_change_pct"])
+            & (context["amount_ratio20"].iloc[post_slice] >= settings["bad_down_amount_ratio20_min"])
+        ).any()
+    )
+
+
+def evaluate_confirm_quality(context, settings, history_length):
+    close = context["close"]
+    amount = context["amount"]
+    confirm_start = max(1, history_length - settings["confirm_window"])
+    confirm_price_volume_up_days = int(
+        ((close.iloc[confirm_start:] > close.shift(1).iloc[confirm_start:]) & (amount.iloc[confirm_start:] > amount.shift(1).iloc[confirm_start:])).sum()
+    )
+    confirm_amount_ratio20 = float(context["amount_ratio20"].iloc[-1])
+    confirm_amount_ok = (
+        confirm_amount_ratio20 >= settings["confirm_amount_ratio20_min"]
+        and confirm_amount_ratio20 <= settings["confirm_amount_ratio20_max"]
+    )
+    confirm_volume_price_pass = confirm_price_volume_up_days >= settings["confirm_price_volume_up_days"] and confirm_amount_ok
+    return {
+        "confirm_price_volume_up_days": confirm_price_volume_up_days,
+        "confirm_amount_ratio20": confirm_amount_ratio20,
+        "confirm_volume_score": 5.0 if confirm_volume_price_pass else 0.0,
+        "confirm_volume_price_pass": bool(confirm_volume_price_pass),
+    }
+
+
+def evaluate_breakout_candidate(zone, context, settings, breakout_start, history_length):
+    breakout_index, breakout_volume_ratio = find_breakout_index(zone, context, settings, breakout_start, history_length)
+    if breakout_index is None:
+        return None
+
+    breakout_day, breakout_score = score_breakout_day(breakout_index, history_length, settings)
+    breakout_quality = evaluate_breakout_day_quality(breakout_index, breakout_volume_ratio, context, settings)
+    pullback_quality = evaluate_pullback_quality(breakout_index, context, settings, history_length)
+    confirm_quality = evaluate_confirm_quality(context, settings, history_length)
+    bad_volume_down_day = has_bad_volume_down_day(breakout_index, context, settings, history_length)
+    volume_price_score = round(pullback_quality["pullback_volume_score"] + confirm_quality["confirm_volume_score"], 2)
+    return {
+        "anchor": zone,
+        "breakout_index": breakout_index,
+        "breakout_day": breakout_day,
+        "breakout_score": round(breakout_score, 2),
+        "breakout_volume_ratio": round(breakout_volume_ratio, 2),
+        "breakout_amount_ratio20": round(breakout_quality["breakout_amount_ratio20"], 2),
+        "breakout_close_position": round(breakout_quality["breakout_close_position"], 2),
+        "pullback_amount_ratio20": round(pullback_quality["pullback_amount_ratio20"], 2),
+        "pullback_amount_vs_breakout": round(pullback_quality["pullback_amount_vs_breakout"], 2),
+        "pullback_volume_score": pullback_quality["pullback_volume_score"],
+        "bad_volume_down_day": bad_volume_down_day,
+        "confirm_price_volume_up_days": confirm_quality["confirm_price_volume_up_days"],
+        "confirm_amount_ratio20": round(confirm_quality["confirm_amount_ratio20"], 2),
+        "volume_price_score": volume_price_score,
+        "breakout_volume_pass": breakout_quality["breakout_volume_pass"],
+        "pullback_shrink_pass": pullback_quality["pullback_shrink_pass"],
+        "confirm_volume_price_pass": confirm_quality["confirm_volume_price_pass"],
+        "breakout_signal": bool(
+            breakout_score >= settings["min_breakout_score"]
+            and breakout_quality["breakout_volume_pass"]
+            and not bad_volume_down_day
+        ),
+    }
+
+
+def select_breakout_candidate(breakout_candidates):
+    selected_pool = [item for item in breakout_candidates if item["breakout_signal"]] or breakout_candidates
+    return max(
+        selected_pool,
+        key=lambda item: (
+            item["anchor"]["price"],
+            item["anchor"]["visibility_score"],
+            item["breakout_volume_ratio"],
+            item["breakout_day"] * -1,
+        ),
+    )
+
+
+def summarize_volume_price(selected_breakout):
+    pullback_text = "回踩缩量" if selected_breakout["pullback_shrink_pass"] else "回踩缩量不足"
+    confirm_text = "确认放量上行" if selected_breakout["confirm_volume_price_pass"] else "确认不足"
+    return (
+        f"突破额比{selected_breakout['breakout_amount_ratio20']:.2f}, "
+        f"收盘位置{selected_breakout['breakout_close_position']:.2f}, "
+        f"{pullback_text}, {confirm_text}{selected_breakout['confirm_price_volume_up_days']}天"
+    )
+
+
+def calc_anchor_shape_score(anchor):
+    visibility = float(anchor.get("visibility_score", 0.0))
+    touches = int(anchor.get("touches", 1))
+    base_days = int(anchor.get("base_days", 0))
+    pullback_pct = float(anchor.get("pullback_pct", 0.0))
+    score = min(10.0, visibility / 10)
+    score += min(3.0, max(0, touches - 1))
+    score += min(3.0, base_days / 10)
+    score += min(4.0, pullback_pct / 5)
+    return round(min(20.0, score), 2)
+
+
+def grade_from_score(score, thresholds):
+    for grade, threshold in thresholds:
+        if score >= threshold:
+            return grade
+    return "D"
+
+
+def calc_anchored_breakout_grade(shape_score, selected_breakout):
+    shape_grade = grade_from_score(shape_score, (("A", 16), ("B", 12), ("C", 8)))
+    if selected_breakout.get("breakout_volume_pass") and selected_breakout.get("pullback_shrink_pass") and selected_breakout.get("confirm_volume_price_pass"):
+        volume_grade = "A"
+    elif selected_breakout.get("breakout_volume_pass") and selected_breakout.get("pullback_shrink_pass"):
+        volume_grade = "B"
+    elif selected_breakout.get("breakout_volume_pass"):
+        volume_grade = "C"
+    else:
+        volume_grade = "D"
+    combined_rank = min("ABCD".index(shape_grade), "ABCD".index(volume_grade))
+    combined_grade = "ABCD"[combined_rank]
+    suffix = "+" if shape_grade != volume_grade and combined_grade in {shape_grade, volume_grade} else ""
+    return shape_grade, f"形态{shape_grade}+量价{volume_grade}={combined_grade}{suffix}"
+
+
+def evaluate_anchored_breakout(df, config, scored_zones=None, cache_key_id=None):
+    settings = config.get("anchored_breakout", {})
+    state = empty_anchored_breakout_state()
+    if not settings.get("enabled", True):
+        return state
+    min_history = max(60, settings["breakout_window"] + settings["anchor_min_gap"] + settings["pivot_right"] * 4)
+    if df.empty or len(df) < min_history:
+        return state
+
+    if scored_zones is None:
+        scored_zones = get_prior_high_zones(df, config, cache_key_id=cache_key_id)
+    if not scored_zones:
+        return state
+    anchor = find_prior_high_anchor(df, config, scored_zones=scored_zones) or scored_zones[0]
+    apply_anchor_state(state, anchor)
+    context = build_breakout_context(df)
+
+    breakout_start = max(0, len(df) - settings["breakout_window"])
+    breakout_candidates = [
+        candidate
+        for candidate in (
+            evaluate_breakout_candidate(zone, context, settings, breakout_start, len(df))
+            for zone in scored_zones
+        )
+        if candidate is not None
+    ]
+
+    if not breakout_candidates:
+        return state
+
+    selected_breakout = select_breakout_candidate(breakout_candidates)
+    selected_anchor = selected_breakout["anchor"]
+    apply_anchor_state(state, selected_anchor)
+    shape_score = calc_anchor_shape_score(selected_anchor)
+    shape_grade, breakout_grade = calc_anchored_breakout_grade(shape_score, selected_breakout)
+
+    state.update(
+        {
+            "anchored_breakout_signal": selected_breakout["breakout_signal"],
+            "anchored_breakout_score": selected_breakout["breakout_score"],
+            "anchored_breakout_day": selected_breakout["breakout_day"],
+            "anchored_breakout_volume_ratio": selected_breakout["breakout_volume_ratio"],
+            "breakout_amount_ratio20": selected_breakout["breakout_amount_ratio20"],
+            "breakout_close_position": selected_breakout["breakout_close_position"],
+            "pullback_amount_ratio20": selected_breakout["pullback_amount_ratio20"],
+            "pullback_amount_vs_breakout": selected_breakout["pullback_amount_vs_breakout"],
+            "pullback_volume_score": selected_breakout["pullback_volume_score"],
+            "bad_volume_down_day": selected_breakout["bad_volume_down_day"],
+            "confirm_price_volume_up_days": selected_breakout["confirm_price_volume_up_days"],
+            "confirm_amount_ratio20": selected_breakout["confirm_amount_ratio20"],
+            "volume_price_score": selected_breakout["volume_price_score"],
+            "anchored_shape_score": shape_score,
+            "anchored_volume_score": selected_breakout["volume_price_score"],
+            "anchored_shape_grade": shape_grade,
+            "anchored_breakout_grade": breakout_grade,
+            "breakout_volume_pass": selected_breakout["breakout_volume_pass"],
+            "pullback_shrink_pass": selected_breakout["pullback_shrink_pass"],
+            "confirm_volume_price_pass": selected_breakout["confirm_volume_price_pass"],
+            "volume_price_summary": summarize_volume_price(selected_breakout),
+        }
+    )
+    return state
 
 
 def analyze_stock_tech(df, config):
@@ -977,6 +1789,11 @@ def analyze_stock_tech(df, config):
     latest["ema13_dist_pct"] = latest["ema_dist_pct"]
     latest["ema_bullish"] = latest["ema_short"] > latest["ema_long"]
     latest["ema13_rising"] = ema_short_series.iloc[-1] > ema_short_series.iloc[-3] if len(ema_short_series) >= 3 else False
+    latest["ema55_rising"] = (
+        ema_long_series.iloc[-1] > ema_long_series.iloc[-3] > ema_long_series.iloc[-5]
+        if len(ema_long_series) >= 5
+        else False
+    )
     latest["ma_bullish"] = (
         latest["ma5"] > latest["ma10"] > latest["ma20"]
         if all([latest["ma5"], latest["ma10"], latest["ma20"]])
@@ -1001,11 +1818,17 @@ def check_pullback_signal(tech, config):
     conditions = {
         "ema_bullish": bool(tech["ema_bullish"]),
         "ema_rising": bool(tech["ema13_rising"]),
+        "ema55_rising": bool(tech.get("ema55_rising", False)),
         "near_ema": abs(tech["ema_dist_pct"]) < threshold,
         "shrink_volume": tech["vol_ratio"] < 1.05,
         "positive_5d": tech["change_5d"] > 0,
     }
-    is_pullback = conditions["ema_bullish"] and conditions["near_ema"] and sum(conditions.values()) >= 4
+    is_pullback = (
+        conditions["ema_bullish"]
+        and conditions["ema55_rising"]
+        and conditions["near_ema"]
+        and sum(conditions.values()) >= 5
+    )
     return is_pullback, conditions
 
 
@@ -1141,26 +1964,29 @@ def apply_sector_concept_boost(
 
 def build_risk_assessment(stock, tech, config):
     risk_cfg = config["risk_filters"]
+    soft_penalties = risk_cfg.get("soft_penalties", {})
+    hard_filters = risk_cfg.get("hard_filters", {})
     notes = []
     penalty = 0
     blocked = False
 
     if stock["pe"] > risk_cfg["high_pe_warning"]:
         notes.append(f"PE {stock['pe']:.0f} 偏高")
-        penalty += 6
+        penalty += soft_penalties.get("high_pe", 6)
     if stock["pe"] < 0:
         notes.append(f"PE {stock['pe']:.0f}")
-        if risk_cfg["exclude_negative_pe"]:
+        penalty += soft_penalties.get("negative_pe", 0)
+        if hard_filters.get("exclude_negative_pe", False) or risk_cfg.get("exclude_negative_pe", False):
             blocked = True
     if tech["change_5d"] > risk_cfg["max_change_5d"]:
         notes.append(f"5日涨幅过高 {tech['change_5d']:.1f}%")
-        penalty += 8
+        penalty += soft_penalties.get("change_5d", 8)
     if tech["vol_ratio"] > risk_cfg["max_vol_ratio"]:
         notes.append(f"量比过高 {tech['vol_ratio']:.2f}")
-        penalty += 5
+        penalty += soft_penalties.get("vol_ratio", 5)
     if tech["volatility_10d"] > risk_cfg["max_volatility_10d"]:
         notes.append(f"10日波动偏高 {tech['volatility_10d']:.1f}%")
-        penalty += 5
+        penalty += soft_penalties.get("volatility_10d", 5)
     return notes or ["正常"], penalty, blocked
 
 
@@ -1168,6 +1994,7 @@ def build_condition_summary(conditions):
     label_map = {
         "ema_bullish": "EMA多头",
         "ema_rising": "EMA向上",
+        "ema55_rising": "EMA55上行",
         "near_ema": "靠近EMA",
         "shrink_volume": "缩量/平量",
         "positive_5d": "5日为正",
@@ -1209,6 +2036,18 @@ def get_signal_grade(score, is_pullback, risk_notes, is_sector_leader):
     return "D"
 
 
+def get_signal_priority(item):
+    if item.get("anchored_breakout_signal") and item.get("confirm_volume_price_pass"):
+        return 4
+    if item.get("is_pullback"):
+        return 3
+    if item.get("breakout_signal"):
+        return 2
+    if item.get("turnaround_signal") or item.get("macd_ignite"):
+        return 1
+    return 0
+
+
 def summarize_returns(returns):
     if not returns:
         return None
@@ -1221,7 +2060,8 @@ def summarize_returns(returns):
     }
 
 
-def build_daily_strategy_state(df, stock):
+def build_daily_strategy_state(df, stock, config=None):
+    config = config or DEFAULT_CONFIG
     if df.empty or len(df) < 250:
         return {
             "ddx": 0.0,
@@ -1231,6 +2071,38 @@ def build_daily_strategy_state(df, stock):
             "turnaround_signal": False,
             "breakout_signal": False,
             "stop_profit_line": None,
+            "anchor_found": False,
+            "anchor_type": None,
+            "anchor_price": None,
+            "anchor_date": None,
+            "anchor_days_ago": None,
+            "anchor_latest_touch_date": None,
+            "anchor_latest_touch_days_ago": None,
+            "anchor_zone_touches": 0,
+            "anchor_visibility_score": 0.0,
+            "anchor_pullback_pct": 0.0,
+            "anchor_base_days": 0,
+            "anchored_breakout_signal": False,
+            "anchored_breakout_score": 0.0,
+            "anchored_breakout_day": None,
+            "anchored_breakout_volume_ratio": 0.0,
+            "breakout_amount_ratio20": 0.0,
+            "breakout_close_position": 0.0,
+            "pullback_amount_ratio20": 0.0,
+            "pullback_amount_vs_breakout": 0.0,
+            "pullback_volume_score": 0.0,
+            "bad_volume_down_day": False,
+            "confirm_price_volume_up_days": 0,
+            "confirm_amount_ratio20": 0.0,
+            "volume_price_score": 0.0,
+            "anchored_shape_score": 0.0,
+            "anchored_volume_score": 0.0,
+            "anchored_shape_grade": "D",
+            "anchored_breakout_grade": "",
+            "breakout_volume_pass": False,
+            "pullback_shrink_pass": False,
+            "confirm_volume_price_pass": False,
+            "volume_price_summary": "",
             "strategy_tags": [],
             "strategy_summary": "无",
         }
@@ -1358,9 +2230,13 @@ def build_daily_strategy_state(df, stock):
         if distance <= 10:
             stop_profit_line = round((close.iloc[last_gain_index] + open_.iloc[last_gain_index]) / 2, 2)
 
+    anchored_breakout = evaluate_anchored_breakout(df, config, cache_key_id=stock.get("code"))
+
     strategy_tags = []
     if breakout_signal:
         strategy_tags.append("趋势突破")
+    if anchored_breakout.get("anchored_breakout_signal"):
+        strategy_tags.append("前高突破")
     if turnaround_signal:
         strategy_tags.append("翻身计划")
     if big_order_alert:
@@ -1376,6 +2252,7 @@ def build_daily_strategy_state(df, stock):
         "turnaround_signal": turnaround_signal,
         "breakout_signal": breakout_signal,
         "stop_profit_line": stop_profit_line,
+        **anchored_breakout,
         "strategy_tags": strategy_tags,
         "strategy_summary": "、".join(strategy_tags) if strategy_tags else "无",
     }
@@ -1387,12 +2264,16 @@ def apply_sector_rps_metrics(candidates, config):
 
     periods = config["rps_periods"]
     threshold = config["rps_threshold"]
+    sample_size = len(candidates)
+    rps_sample_too_small = sample_size < config.get("rps_min_sample", 5)
     for period in periods:
         change_key = f"change_{period}d"
         ranked = sorted(candidates, key=lambda item: item.get(change_key, float("-inf")))
         total = len(ranked)
         for rank, item in enumerate(ranked, 1):
-            item[f"rps{period}"] = round(rank / total * 100, 2)
+            rps_value = round(rank / total * 100, 2)
+            item[f"rps{period}"] = rps_value
+            item[f"sector_pool_rps{period}"] = rps_value
 
     for item in candidates:
         rps10 = item.get("rps10", 0)
@@ -1410,12 +2291,19 @@ def apply_sector_rps_metrics(candidates, config):
         three_cycle_red = ar1 and (br1 or ir1) and (dr1 or j1)
         four_cycle_red = ar1 and sum((br1, ir1, j1, dr1)) >= 3
         strong_periods = sum((ar1, br1, ir1, j1, dr1))
+        if rps_sample_too_small:
+            three_cycle_red = False
+            four_cycle_red = False
+            strong_periods = 0
 
         item["three_cycle_red"] = three_cycle_red
         item["four_cycle_red"] = four_cycle_red
         item["rps_strong_periods"] = strong_periods
+        item["rps_scope"] = "sector_pool"
+        item["rps_sample_size"] = sample_size
+        item["rps_sample_too_small"] = rps_sample_too_small
         item["rps_summary"] = (
-            f"RPS10/20/50/120/250="
+            f"板块池RPS10/20/50/120/250="
             f"{item.get('rps10', 0):.1f}/{item.get('rps20', 0):.1f}/{item.get('rps50', 0):.1f}/"
             f"{item.get('rps120', 0):.1f}/{item.get('rps250', 0):.1f}"
         )
@@ -1423,10 +2311,242 @@ def apply_sector_rps_metrics(candidates, config):
             item["rps_summary"] += " | 四周期红"
         elif three_cycle_red:
             item["rps_summary"] += " | 三周期红"
+        if rps_sample_too_small:
+            item["rps_summary"] += f" | 样本不足{sample_size}"
     return candidates
 
 
-def screen_stocks_in_sector(sector, config, analysis_date, use_cache=True, cache_only=False):
+def get_light_history_days(config):
+    return max(
+        80,
+        config["ema_long"] + max(config["analysis_days"]) + 30,
+        max(config["rps_periods"]) + 30,
+    )
+
+
+def get_full_history_days(config):
+    return max(get_light_history_days(config), config["history_window_days"])
+
+
+def build_scan_diagnostics(track_candidates=True):
+    return {
+        "stage_counts": defaultdict(int),
+        "reject_reasons": defaultdict(int),
+        "candidates": [],
+        "track_candidates": track_candidates,
+    }
+
+
+def bump_scan_count(scan_diagnostics, bucket, key, amount=1):
+    if scan_diagnostics is None:
+        return
+    scan_diagnostics.setdefault(bucket, defaultdict(int))[key] += amount
+
+
+def normalize_scan_diagnostics(scan_diagnostics):
+    if not scan_diagnostics:
+        return {"stage_counts": {}, "reject_reasons": {}, "candidates": []}
+    return {
+        "stage_counts": dict(scan_diagnostics.get("stage_counts", {})),
+        "reject_reasons": dict(scan_diagnostics.get("reject_reasons", {})),
+        "candidates": list(scan_diagnostics.get("candidates", [])),
+    }
+
+
+def sanitize_candidate_for_export(item):
+    blocked_keys = {"_history", "risk_notes", "base_score"}
+    return {
+        key: value
+        for key, value in item.items()
+        if key not in blocked_keys and not key.startswith("_")
+    }
+
+
+def record_scan_candidate(scan_diagnostics, item, status, reason=""):
+    if scan_diagnostics is None:
+        return
+    bump_scan_count(scan_diagnostics, "stage_counts", status)
+    if reason:
+        bump_scan_count(scan_diagnostics, "reject_reasons", reason)
+    if not scan_diagnostics.get("track_candidates", True):
+        return
+    snapshot = sanitize_candidate_for_export(item)
+    snapshot["scan_status"] = status
+    snapshot["reject_reason"] = reason
+    scan_diagnostics.setdefault("candidates", []).append(snapshot)
+
+
+def record_member_reject(scan_diagnostics, sector, stock, reason):
+    item = {
+        "sector": sector["name"],
+        "code": stock.get("code", ""),
+        "name": stock.get("name", ""),
+        "price": to_float(stock.get("price")),
+        "pe": to_float(stock.get("pe")),
+        "amount": round(to_float(stock.get("amount")), 2),
+        "turnover": round(to_float(stock.get("turnover")), 2),
+    }
+    record_scan_candidate(scan_diagnostics, item, "rejected", reason)
+
+
+def build_initial_signal_breakdown(tech):
+    return {
+        "trend_pass": bool(tech.get("ema_bullish") and tech.get("ema13_rising")),
+        "ema55_pass": bool(tech.get("ema55_rising", False)),
+        "rps_pass": False,
+        "breakout_setup_pass": False,
+        "anchored_breakout_pass": False,
+        "volume_quality_pass": False,
+        "breakout_volume_pass": False,
+        "pullback_shrink_pass": False,
+        "confirm_volume_price_pass": False,
+    }
+
+
+def update_signal_breakdown_summary(item):
+    breakdown = item.get("signal_breakdown", {})
+    label_map = {
+        "trend_pass": "趋势",
+        "rps_pass": "RPS",
+        "ema55_pass": "EMA55",
+        "breakout_setup_pass": "突破迹象",
+        "anchored_breakout_pass": "前高突破",
+        "volume_quality_pass": "量价质量",
+        "breakout_volume_pass": "突破量价",
+        "pullback_shrink_pass": "回踩缩量",
+        "confirm_volume_price_pass": "确认放量",
+    }
+    item["signal_breakdown_summary"] = " / ".join(
+        f"{label}{'通过' if breakdown.get(key) else '未过'}" for key, label in label_map.items()
+    )
+    return item
+
+
+def has_light_breakout_setup(df, tech, config):
+    if df.empty:
+        return False
+    price = to_float(tech.get("price"))
+    if price <= 0:
+        return False
+    setup_cfg = config["light_breakout_setup"]
+    high = df["high"].astype(float) if "high" in df else df["close"].astype(float)
+    window = min(setup_cfg["near_high_window"], len(high))
+    recent_high = to_float(high.tail(window).max())
+    if recent_high <= 0:
+        return False
+    near_recent_high = price >= recent_high * setup_cfg["near_high_pct"]
+    low = df["low"].astype(float) if "low" in df else df["close"].astype(float)
+    recent_low = to_float(low.tail(window).min())
+    recent_drawdown = (recent_high - recent_low) / recent_high if recent_high > 0 else 0.0
+    ema55 = to_float(tech.get("ema55") or tech.get("ema_long"))
+    ema55_dist = abs(price - ema55) / ema55 if ema55 > 0 else 0.0
+    if tech.get("change_20d", 0) > setup_cfg["max_change_20d"]:
+        return False
+    if ema55_dist > setup_cfg["max_ema55_dist_pct"]:
+        return False
+    if recent_drawdown > setup_cfg["max_recent_drawdown_pct"]:
+        return False
+    positive_5d = tech.get("change_5d", 0) > 0 if setup_cfg["require_positive_5d"] else tech.get("change_5d", 0) >= 0
+    volume_clue = tech.get("vol_ratio", 0) >= setup_cfg["min_vol_ratio"] and positive_5d
+    momentum_clue = tech.get("change_10d", 0) > 0 and tech.get("change_5d", 0) >= 0
+    return bool(near_recent_high and (volume_clue or momentum_clue))
+
+
+def get_light_reject_reason(item):
+    breakdown = item.get("signal_breakdown", {})
+    if not breakdown.get("trend_pass"):
+        return "趋势未通过"
+    if not breakdown.get("ema55_pass"):
+        return "EMA55未上行"
+    if not (breakdown.get("rps_pass") or breakdown.get("breakout_setup_pass")):
+        return "RPS和突破迹象均未通过"
+    return ""
+
+
+def build_volume_quality_state(item, weights, volume_price_weight):
+    basic_score = weights.get("volume_confirm", 0) if item.get("basic_volume_pass") else 0
+    anchored_score = (
+        min(item.get("volume_price_score", 0), volume_price_weight)
+        if item.get("anchored_breakout_signal")
+        else 0
+    )
+    score = max(basic_score, anchored_score)
+    if item.get("anchored_breakout_signal") and item.get("breakout_volume_pass") and item.get("pullback_shrink_pass") and item.get("confirm_volume_price_pass"):
+        grade = "A"
+        grade_scope = "突破"
+    elif item.get("anchored_breakout_signal") and item.get("breakout_volume_pass") and item.get("pullback_shrink_pass"):
+        grade = "B"
+        grade_scope = "突破"
+    elif item.get("anchored_breakout_signal") and item.get("breakout_volume_pass"):
+        grade = "C"
+        grade_scope = "突破"
+    elif item.get("basic_volume_pass"):
+        grade = "C"
+        grade_scope = "普通"
+    else:
+        grade = "D"
+        grade_scope = "普通"
+    if anchored_score >= basic_score and anchored_score > 0:
+        summary = f"{grade_scope}{grade}级，前高量价 +{anchored_score:.1f}"
+    elif basic_score > 0:
+        summary = f"{grade_scope}{grade}级，普通放量 +{basic_score:.1f}"
+    else:
+        summary = f"{grade_scope}{grade}级，量价未加分"
+    return {
+        "volume_quality_score": round(score, 2),
+        "volume_quality_grade": grade,
+        "volume_quality_grade_scope": grade_scope,
+        "volume_quality_summary": summary,
+        "volume_quality_pass": score > 0,
+    }
+
+
+def build_initial_score_components(tech, is_pullback, risk_notes, risk_penalty, is_sector_leader, weights):
+    trend_score = 0.0
+    if tech["ema_bullish"]:
+        trend_score += weights["ema_bullish"]
+    if tech["ema13_rising"]:
+        trend_score += weights["ema_rising"]
+    if tech["ma_bullish"]:
+        trend_score += weights["ma_bullish"]
+
+    components = {
+        "trend_score": trend_score,
+        "pullback_score": weights["pullback"] if is_pullback else 0.0,
+        "risk_score": weights["low_risk"] if risk_notes == ["正常"] else 0.0,
+        "sector_leader_score": weights.get("sector_leader", 0) if is_sector_leader else 0.0,
+        "risk_penalty": risk_penalty,
+        "rps_score": 0.0,
+        "volume_quality_score": 0.0,
+        "breakout_score": 0.0,
+        "strategy_score": 0.0,
+        "base_score": 0.0,
+        "final_score": 0.0,
+    }
+    components["base_score"] = round(
+        components["trend_score"]
+        + components["pullback_score"]
+        + components["risk_score"]
+        + components["sector_leader_score"]
+        - components["risk_penalty"],
+        2,
+    )
+    return components
+
+
+def finalize_score_components(components):
+    final_score = (
+        components.get("base_score", 0.0)
+        + components.get("rps_score", 0.0)
+        + components.get("volume_quality_score", 0.0)
+        + components.get("breakout_score", 0.0)
+        + components.get("strategy_score", 0.0)
+    )
+    components["final_score"] = round(final_score, 2)
+    return components
+
+
+def screen_stocks_in_sector(sector, config, analysis_date, use_cache=True, cache_only=False, scan_diagnostics=None):
     members = get_sector_members(
         sector["name"],
         sector["type"],
@@ -1437,34 +2557,47 @@ def screen_stocks_in_sector(sector, config, analysis_date, use_cache=True, cache
     if not members:
         return []
 
-    history_days = max(
-        80,
-        config["ema_long"] + max(config["analysis_days"]) + 30,
-        max(config["rps_periods"]) + 30,
-    )
+    light_history_days = get_light_history_days(config)
+    full_history_days = get_full_history_days(config)
     ranked_members = rank_sector_members(members)
-    valid_members = [
-        item
-        for item in ranked_members
-        if "ST" not in item["name"] and item["price"] > 0 and item["pe"] > -100
-    ][: config["sector_member_limit"]]
+    bump_scan_count(scan_diagnostics, "stage_counts", "members_seen", len(ranked_members))
+    eligible_members = []
+    for item in ranked_members:
+        if "ST" in item["name"]:
+            record_member_reject(scan_diagnostics, sector, item, "ST股票")
+            continue
+        if item["price"] <= 0:
+            record_member_reject(scan_diagnostics, sector, item, "价格无效")
+            continue
+        if item["pe"] <= -100:
+            record_member_reject(scan_diagnostics, sector, item, "PE异常")
+            continue
+        eligible_members.append(item)
+
+    valid_members = eligible_members[: config["sector_member_limit"]]
+    for item in eligible_members[config["sector_member_limit"] :]:
+        record_member_reject(scan_diagnostics, sector, item, "超出板块成员上限")
+
     leader_codes = build_sector_leaders(valid_members)
     candidates = []
     weights = config["score_weights"]["stock"]
     min_stock_score = config["min_stock_score"]
 
     for stock in valid_members:
+        bump_scan_count(scan_diagnostics, "stage_counts", "members_scanned")
         df_hist = get_stock_history(
             stock["code"],
             end_date=analysis_date,
-            days=history_days,
+            days=light_history_days,
             use_cache=use_cache,
             cache_only=cache_only,
         )
         if df_hist.empty:
+            record_member_reject(scan_diagnostics, sector, stock, "短历史缺失")
             continue
         tech = analyze_stock_tech(df_hist, config)
         if not tech:
+            record_member_reject(scan_diagnostics, sector, stock, "技术指标不足")
             continue
 
         is_pullback, conditions = check_pullback_signal(tech, config)
@@ -1472,25 +2605,12 @@ def screen_stocks_in_sector(sector, config, analysis_date, use_cache=True, cache
         signal = get_signal_type(tech, is_pullback)
         risk_notes, risk_penalty, blocked = build_risk_assessment(stock, tech, config)
         if blocked and config["risk_filters"]["strict_mode"]:
+            record_member_reject(scan_diagnostics, sector, stock, "风险过滤")
             continue
 
-        score = 0
-        if tech["ema_bullish"]:
-            score += weights["ema_bullish"]
-        if tech["ema13_rising"]:
-            score += weights["ema_rising"]
-        if is_pullback:
-            score += weights["pullback"]
-        if tech["ma_bullish"]:
-            score += weights["ma_bullish"]
-        if tech["vol_ratio"] > 1.2 and tech["change_5d"] > 0:
-            score += weights["volume_confirm"]
-        if risk_notes == ["正常"]:
-            score += weights["low_risk"]
         is_sector_leader = stock["code"] in leader_codes
-        if is_sector_leader:
-            score += weights.get("sector_leader", 0)
-        score -= risk_penalty
+        score_components = build_initial_score_components(tech, is_pullback, risk_notes, risk_penalty, is_sector_leader, weights)
+        score = score_components["base_score"]
         candidates.append(
             {
                 "sector": sector["name"],
@@ -1522,47 +2642,114 @@ def screen_stocks_in_sector(sector, config, analysis_date, use_cache=True, cache
                 "failed_conditions": failed,
                 "risk_notes": risk_notes,
                 "base_score": round(score, 2),
+                "score_components": score_components,
+                "signal_breakdown": build_initial_signal_breakdown(tech),
+                "basic_volume_pass": bool(tech["vol_ratio"] > config["light_breakout_setup"]["min_vol_ratio"] and tech["change_5d"] > 0),
+                "breakout_setup_pass": has_light_breakout_setup(df_hist, tech, config),
+                "volume_quality_score": 0.0,
+                "volume_quality_grade": "D",
+                "volume_quality_summary": "",
                 "_history": df_hist,
                 "summary": "",
             }
         )
 
     apply_sector_rps_metrics(candidates, config)
+    light_passed = []
     for item in candidates:
-        score = item["base_score"]
-        strategy_state = build_daily_strategy_state(item["_history"], item)
+        item["signal_breakdown"]["rps_pass"] = item.get("rps_strong_periods", 0) > 0
+        item["signal_breakdown"]["breakout_setup_pass"] = item.get("breakout_setup_pass", False)
+        update_signal_breakdown_summary(item)
+        if (
+            item["signal_breakdown"]["trend_pass"]
+            and item["signal_breakdown"]["ema55_pass"]
+            and (item["signal_breakdown"]["rps_pass"] or item["signal_breakdown"]["breakout_setup_pass"])
+        ):
+            light_passed.append(item)
+            bump_scan_count(scan_diagnostics, "stage_counts", "light_passed")
+        else:
+            record_scan_candidate(scan_diagnostics, item, "rejected", get_light_reject_reason(item))
+
+    scored_candidates = []
+    volume_price_weight = config["anchored_breakout"]["volume_price_weight"]
+    for item in light_passed:
+        full_history = item["_history"]
+        if full_history_days > light_history_days:
+            full_history = get_stock_history(
+                item["code"],
+                end_date=analysis_date,
+                days=full_history_days,
+                use_cache=use_cache,
+                cache_only=cache_only,
+            )
+            if full_history.empty:
+                record_scan_candidate(scan_diagnostics, item, "rejected", "长历史缺失")
+                continue
+            item["_history"] = full_history
+            item["change_pct"] = round(calc_latest_change_pct(full_history), 2)
+
+        score_components = item.get("score_components", {})
+        strategy_state = build_daily_strategy_state(item["_history"], item, config)
         item.update(strategy_state)
+        item["signal_breakdown"].update(
+            {
+                "anchored_breakout_pass": bool(item.get("anchored_breakout_signal")),
+                "breakout_volume_pass": bool(item.get("breakout_volume_pass")),
+                "pullback_shrink_pass": bool(item.get("pullback_shrink_pass")),
+                "confirm_volume_price_pass": bool(item.get("confirm_volume_price_pass")),
+            }
+        )
+        volume_quality = build_volume_quality_state(item, weights, volume_price_weight)
+        item.update(volume_quality)
+        item["signal_breakdown"]["volume_quality_pass"] = volume_quality["volume_quality_pass"]
+        score_components["volume_quality_score"] = volume_quality["volume_quality_score"]
         if item.get("four_cycle_red"):
-            score += weights.get("rps_four_cycle_red", 0)
+            score_components["rps_score"] = weights.get("rps_four_cycle_red", 0)
         elif item.get("three_cycle_red"):
-            score += weights.get("rps_three_cycle_red", 0)
+            score_components["rps_score"] = weights.get("rps_three_cycle_red", 0)
         if item.get("big_order_alert"):
-            score += weights.get("big_order_alert", 0)
+            score_components["strategy_score"] += weights.get("big_order_alert", 0)
         if item.get("macd_ignite"):
-            score += weights.get("macd_ignite", 0)
+            score_components["strategy_score"] += weights.get("macd_ignite", 0)
+        if item.get("anchored_breakout_signal"):
+            score_components["breakout_score"] += weights.get("anchored_breakout", 0)
         if item.get("turnaround_signal"):
-            score += weights.get("turnaround", 0)
+            score_components["strategy_score"] += weights.get("turnaround", 0)
         if item.get("breakout_signal"):
-            score += weights.get("breakout", 0)
+            score_components["breakout_score"] += weights.get("breakout", 0)
             item["signal"] = "趋势突破"
         elif item.get("turnaround_signal") and item["signal"] != "回踩买点":
             item["signal"] = "翻身计划"
+        if item.get("anchored_breakout_signal") and item["signal"] == "观察":
+            item["signal"] = "前高突破"
         elif item.get("macd_ignite") and item["signal"] == "观察":
             item["signal"] = "点火预备"
-        item["score"] = round(score, 2)
-        item["signal_grade"] = get_signal_grade(score, item["is_pullback"], item["risk_notes"], item["is_sector_leader"])
+        finalize_score_components(score_components)
+        item["score_components"] = score_components
+        item["score"] = score_components["final_score"]
+        item["signal_grade"] = get_signal_grade(item["score"], item["is_pullback"], item["risk_notes"], item["is_sector_leader"])
+        update_signal_breakdown_summary(item)
         item["summary"] = (
             f"满足: {'、'.join(item['matched_conditions']) if item['matched_conditions'] else '无'}; "
             f"未满足: {'、'.join(item['failed_conditions']) if item['failed_conditions'] else '无'}; "
             f"风险: {'、'.join(item['risk_notes'])}; "
             f"强度: {item['rps_summary']}; "
+            f"量价: {item['volume_quality_summary']}; "
             f"策略: {item['strategy_summary']}"
         )
+        scored_candidates.append(item)
 
-    candidates = [item for item in candidates if item["score"] >= min_stock_score]
+    candidates = []
+    for item in scored_candidates:
+        if item["score"] >= min_stock_score:
+            candidates.append(item)
+            bump_scan_count(scan_diagnostics, "stage_counts", "score_passed")
+        else:
+            record_scan_candidate(scan_diagnostics, item, "rejected", "评分低于阈值")
     candidates.sort(
         key=lambda item: (
             item["score"],
+            get_signal_priority(item),
             item.get("four_cycle_red", False),
             item.get("three_cycle_red", False),
             item["is_pullback"],
@@ -1578,6 +2765,15 @@ def screen_stocks_in_sector(sector, config, analysis_date, use_cache=True, cache
     remaining = config["stocks_per_sector"] - len(result)
     if remaining > 0:
         result.extend(others[:remaining])
+    selected_keys = {(item["sector"], item["code"]) for item in result}
+    for rank, item in enumerate(candidates, 1):
+        item["sector_rank"] = rank
+        item["sector_rank_gap"] = max(0, rank - config["stocks_per_sector"])
+        if (item["sector"], item["code"]) in selected_keys:
+            record_scan_candidate(scan_diagnostics, item, "selected")
+            bump_scan_count(scan_diagnostics, "stage_counts", "sector_selected")
+        else:
+            record_scan_candidate(scan_diagnostics, item, "not_selected", "未进入每板块名额")
     for item in result:
         item.pop("risk_notes", None)
         item.pop("base_score", None)
@@ -1602,6 +2798,7 @@ def evaluate_saved_picks(as_of_date, config, use_cache=True, cache_only=False):
     lookback_days = config["backtest"]["lookback_days"]
     holding_days = config["backtest"]["holding_days"]
     min_samples = config["backtest"]["min_samples"]
+    entry_price_basis = config["backtest"]["entry_price_basis"]
     start_date = (datetime.strptime(as_of_date, "%Y-%m-%d") - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
 
     conn = sqlite3.connect(str(DB_PATH))
@@ -1644,7 +2841,7 @@ def evaluate_saved_picks(as_of_date, config, use_cache=True, cache_only=False):
         if history.empty or "date" not in history.columns:
             continue
         history = history.reset_index(drop=True)
-        entry_index, entry_price = resolve_signal_entry(history, row.date)
+        entry_index, entry_price = resolve_signal_entry(history, row.date, entry_price_basis)
         if entry_index is None:
             continue
         for day in holding_days:
@@ -1660,12 +2857,8 @@ def evaluate_saved_picks(as_of_date, config, use_cache=True, cache_only=False):
             if benchmark_history.empty or "date" not in benchmark_history.columns:
                 continue
             benchmark_history = benchmark_history.reset_index(drop=True)
-            try:
-                benchmark_index = benchmark_history.index[benchmark_history["date"] == row.date][0]
-            except IndexError:
-                continue
-            benchmark_entry = float(benchmark_history.iloc[benchmark_index]["close"])
-            if benchmark_entry <= 0:
+            benchmark_index, benchmark_entry = resolve_signal_entry(benchmark_history, row.date, entry_price_basis)
+            if benchmark_index is None:
                 continue
             for day in holding_days:
                 target_index = benchmark_index + day
@@ -1677,7 +2870,7 @@ def evaluate_saved_picks(as_of_date, config, use_cache=True, cache_only=False):
 
     summary = {
         "sample_days": lookback_days,
-        "entry_price_basis": config["backtest"]["entry_price_basis"],
+        "entry_price_basis": entry_price_basis,
         "metrics": {},
     }
     for day, returns in results.items():
@@ -1749,6 +2942,59 @@ def apply_pick_filters(picks, args, config):
         threshold = config["risk_filters"]["high_pe_warning"]
         filtered = [item for item in filtered if item.get("pe", 0) <= threshold]
     return filtered
+
+
+def merge_stock_pick(picks_by_code, stock):
+    code = stock["code"]
+    existing = picks_by_code.get(code)
+    if not existing:
+        stock["source_sectors"] = [stock["sector"]]
+        stock["first_sector"] = stock["sector"]
+        stock["best_sector"] = stock["sector"]
+        stock["sector_overlap_count"] = 1
+        picks_by_code[code] = stock
+        return
+
+    source_sectors = sorted(set(existing.get("source_sectors", [existing["sector"]]) + [stock["sector"]]))
+    if stock.get("score", 0) > existing.get("score", 0):
+        first_sector = existing.get("first_sector", existing["sector"])
+        stock["source_sectors"] = source_sectors
+        stock["first_sector"] = first_sector
+        stock["best_sector"] = stock["sector"]
+        stock["sector_overlap_count"] = len(source_sectors)
+        picks_by_code[code] = stock
+    else:
+        existing["source_sectors"] = source_sectors
+        existing["sector_overlap_count"] = len(source_sectors)
+        existing["best_sector"] = existing.get("best_sector", existing["sector"])
+
+
+def screen_classified_sectors(classified, config, analysis_date, use_cache=True, cache_only=False):
+    picks_by_code = {}
+    scan_diagnostics = build_scan_diagnostics(track_candidates=config.get("track_candidates", True))
+    for sector in classified["hot"] + classified["potential"]:
+        logger.info("screen sector: %s", sector["name"])
+        picks = screen_stocks_in_sector(
+            sector,
+            config,
+            analysis_date,
+            use_cache=use_cache,
+            cache_only=cache_only,
+            scan_diagnostics=scan_diagnostics,
+        )
+        for stock in picks:
+            merge_stock_pick(picks_by_code, stock)
+        sleep_seconds = config.get("sector_scan_sleep_seconds", 0.0)
+        if not cache_only and sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+    all_stock_picks = sorted(picks_by_code.values(), key=lambda item: item.get("score", 0), reverse=True)
+    bump_scan_count(scan_diagnostics, "stage_counts", "global_selected", len(all_stock_picks))
+    sector_selected = scan_diagnostics.get("stage_counts", {}).get("sector_selected", 0)
+    deduplicated_count = max(0, sector_selected - len(all_stock_picks))
+    if deduplicated_count:
+        bump_scan_count(scan_diagnostics, "stage_counts", "deduplicated_count", deduplicated_count)
+    return all_stock_picks, scan_diagnostics
 
 
 def build_day_over_day_comparison(date_str, classified, picks, sector_filters=None):
@@ -1835,14 +3081,97 @@ def format_source_lines():
         records = meta.get("records")
         lines.append(f"- {name}: {source}, records={records if records is not None else '-'}")
     for name, stats in sorted(RUNTIME_META["cache_stats"].items()):
-        if stats["live"] or stats["cache"]:
-            lines.append(f"- {name}: live={stats['live']}, cache={stats['cache']}")
+        active_stats = {key: value for key, value in stats.items() if value}
+        if active_stats:
+            lines.append(f"- {name}: " + ", ".join(f"{key}={value}" for key, value in sorted(active_stats.items())))
     for item in RUNTIME_META["notes"]:
         lines.append(f"- note: {item}")
     return lines
 
 
-def build_payload(date_str, classified, picks, streaks, backtest, comparison, alerts, filters, config):
+def build_edge_candidates(scan_diagnostics, config):
+    normalized = normalize_scan_diagnostics(scan_diagnostics)
+    candidates = []
+    min_edge_score = config["min_stock_score"] - config["edge_candidate_score_gap"]
+    selected_codes = {
+        item.get("code")
+        for item in normalized["candidates"]
+        if item.get("scan_status") == "selected"
+    }
+    for item in normalized["candidates"]:
+        code = item.get("code")
+        if not code or code in selected_codes:
+            continue
+        score = to_float(item.get("score"))
+        breakdown = item.get("signal_breakdown", {}) or {}
+        reason = item.get("reject_reason", "")
+        near_score = score >= min_edge_score
+        strong_breakout_incomplete = bool(
+            breakdown.get("anchored_breakout_pass")
+            and not breakdown.get("confirm_volume_price_pass")
+        )
+        not_selected = item.get("scan_status") == "not_selected"
+        if near_score or strong_breakout_incomplete or not_selected:
+            edge_item = dict(item)
+            edge_reasons = []
+            if not_selected:
+                edge_reasons.append("未进入每板块名额")
+            if strong_breakout_incomplete:
+                edge_reasons.append("前高突破但确认不足")
+            if near_score and score < config["min_stock_score"]:
+                edge_reasons.append("接近评分阈值")
+            if breakdown.get("breakout_setup_pass") and not breakdown.get("rps_pass"):
+                edge_reasons.append("RPS未过但突破迹象通过")
+            if reason and reason not in edge_reasons:
+                edge_reasons.append(reason)
+            edge_item["edge_reasons"] = edge_reasons or [reason or "边缘候选"]
+            edge_item["edge_reason"] = "、".join(edge_item["edge_reasons"])
+            edge_item["score_gap_to_min"] = round(max(0.0, config["min_stock_score"] - score), 2)
+            candidates.append(edge_item)
+
+    candidates.sort(
+        key=lambda item: (
+            to_float(item.get("score")),
+            bool((item.get("signal_breakdown") or {}).get("anchored_breakout_pass")),
+            to_float(item.get("amount")),
+        ),
+        reverse=True,
+    )
+    return candidates[: config["edge_candidates_limit"]]
+
+
+def filter_edge_candidates(edge_candidates, args, config):
+    filtered = list(edge_candidates)
+    sector_filters = normalize_sector_filters(args.sector)
+    if sector_filters:
+        allowed = set(sector_filters)
+        filtered = [item for item in filtered if item.get("sector") in allowed]
+    if args.only_pullback:
+        filtered = [item for item in filtered if item.get("is_pullback")]
+    if args.min_score is not None:
+        filtered = [item for item in filtered if item.get("score", 0) >= args.min_score]
+    if args.exclude_high_pe:
+        threshold = config["risk_filters"]["high_pe_warning"]
+        filtered = [item for item in filtered if item.get("pe", 0) <= threshold]
+    return filtered
+
+
+def build_payload(
+    date_str,
+    classified,
+    picks,
+    streaks,
+    backtest,
+    comparison,
+    alerts,
+    filters,
+    config,
+    scan_diagnostics=None,
+    edge_candidates=None,
+):
+    normalized_scan = normalize_scan_diagnostics(scan_diagnostics)
+    if edge_candidates is None:
+        edge_candidates = build_edge_candidates(scan_diagnostics, config)
     return {
         "analysis_date": date_str,
         "metadata": {
@@ -1858,6 +3187,12 @@ def build_payload(date_str, classified, picks, streaks, backtest, comparison, al
         "comparison": comparison,
         "alerts": alerts,
         "backtest": backtest,
+        "scan_stats": {
+            "stage_counts": normalized_scan["stage_counts"],
+            "reject_reasons": normalized_scan["reject_reasons"],
+        },
+        "stock_candidates": normalized_scan["candidates"] if config.get("export_candidates", True) else [],
+        "edge_candidates": edge_candidates,
     }
 
 
@@ -1871,7 +3206,94 @@ def generate_alert_report(date_str, alerts, comparison):
     return "\n".join(lines)
 
 
-def generate_report(date_str, classified, picks, streaks, backtest, comparison, alerts, config, alerts_only=False):
+def format_prior_high_detail(stock):
+    if not stock.get("anchor_found"):
+        return ""
+    anchor_date = stock.get("anchor_date") or "-"
+    anchor_type = get_anchor_type_label(stock.get("anchor_type"))
+    anchor_price = stock.get("anchor_price")
+    price_text = f"{anchor_price:.2f}" if anchor_price is not None else "-"
+    volume_text = stock.get("volume_price_summary") or "暂无突破量价确认"
+    grade_text = f"，等级: {stock.get('anchored_breakout_grade')}" if stock.get("anchored_breakout_grade") else ""
+    return f"前高: {anchor_date} {anchor_type}，突破价 {price_text}，量价: {volume_text}{grade_text}"
+
+
+def format_edge_candidate_line(item):
+    score = to_float(item.get("score"))
+    reason = item.get("edge_reason") or item.get("reject_reason") or "-"
+    signal = item.get("signal", "-")
+    sector = item.get("sector", "-")
+    score_gap = to_float(item.get("score_gap_to_min"))
+    rank_gap = to_int(item.get("sector_rank_gap"))
+    gap_text = f" | 差最低分 {score_gap:.1f}" if score_gap > 0 else ""
+    rank_text = f" | 差板块名额 {rank_gap}名" if rank_gap > 0 else ""
+    return f"- {item.get('name', '-')} {item.get('code', '-')} [{sector}] | {signal} | 评分 {score:.2f}{gap_text}{rank_text} | {reason}"
+
+
+def format_score_components(item):
+    components = item.get("score_components") or {}
+    if not components:
+        return ""
+    return (
+        f"基础 {components.get('base_score', 0):.1f} | "
+        f"RPS {components.get('rps_score', 0):.1f} | "
+        f"量价 {components.get('volume_quality_score', 0):.1f} | "
+        f"突破 {components.get('breakout_score', 0):.1f} | "
+        f"策略 {components.get('strategy_score', 0):.1f} | "
+        f"风险扣分 {components.get('risk_penalty', 0):.1f}"
+    )
+
+
+def format_config_snapshot(config):
+    setup_cfg = config["light_breakout_setup"]
+    return (
+        f"- 最低个股分 {config['min_stock_score']} | RPS阈值 {config['rps_threshold']} | "
+        f"RPS最小样本 {config['rps_min_sample']} | 长历史 {config['history_window_days']}天 | "
+        f"轻筛接近前高 {setup_cfg['near_high_pct']:.2f} | 量比阈值 {setup_cfg['min_vol_ratio']:.2f}"
+    )
+
+
+def build_resonance_stocks(picks):
+    return sorted(
+        [item for item in picks if item.get("sector_overlap_count", 1) > 1],
+        key=lambda item: (item.get("sector_overlap_count", 1), item.get("score", 0)),
+        reverse=True,
+    )
+
+
+def generate_screening_diagnostics_report(date_str, scan_stats, edge_candidates):
+    stage_counts = scan_stats.get("stage_counts", {})
+    reject_reasons = scan_stats.get("reject_reasons", {})
+    lines = [f"筛选诊断 | {date_str}", "=" * 40, ""]
+    lines.append(
+        f"- 成员 {stage_counts.get('members_seen', 0)} | 扫描 {stage_counts.get('members_scanned', 0)} | 轻筛通过 {stage_counts.get('light_passed', 0)} | 评分通过 {stage_counts.get('score_passed', 0)} | 板块入选 {stage_counts.get('sector_selected', 0)} | 全局入选 {stage_counts.get('global_selected', 0)} | 去重 {stage_counts.get('deduplicated_count', 0)}"
+    )
+    if reject_reasons:
+        lines.append("")
+        lines.extend(["主要淘汰原因", "-" * 40])
+        for reason, count in sorted(reject_reasons.items(), key=lambda item: item[1], reverse=True)[:12]:
+            lines.append(f"- {reason}: {count}")
+    if edge_candidates:
+        lines.append("")
+        lines.extend(["边缘候选", "-" * 40])
+        for item in edge_candidates:
+            lines.append(format_edge_candidate_line(item))
+    return "\n".join(lines)
+
+
+def generate_report(
+    date_str,
+    classified,
+    picks,
+    streaks,
+    backtest,
+    comparison,
+    alerts,
+    config,
+    alerts_only=False,
+    scan_stats=None,
+    edge_candidates=None,
+):
     if alerts_only:
         return generate_alert_report(date_str, alerts, comparison)
 
@@ -1879,6 +3301,10 @@ def generate_report(date_str, classified, picks, streaks, backtest, comparison, 
     potential_count = len(classified["potential"])
     lines = [f"板块跟踪日报 | {date_str}", "=" * 40, "", "数据状态", "-" * 40]
     lines.extend(format_source_lines() or ["- 无"])
+    lines.append("")
+
+    lines.extend(["配置快照", "-" * 40])
+    lines.append(format_config_snapshot(config))
     lines.append("")
 
     lines.extend(["告警摘要", "-" * 40])
@@ -1907,17 +3333,41 @@ def generate_report(date_str, classified, picks, streaks, backtest, comparison, 
             )
             lines.append(f"  价格 {stock['price']:.2f} | EMA差 {stock['ema13_dist_pct']:+.1f}% | 量比 {stock['vol_ratio']}")
             lines.append(f"  解释 {stock['summary']}")
+            score_detail = format_score_components(stock)
+            if score_detail:
+                lines.append(f"  分数 {score_detail}")
             if stock.get("rps_summary"):
                 lines.append(f"  RPS {stock['rps_summary']}")
             if stock.get("strategy_summary") and stock["strategy_summary"] != "无":
                 lines.append(f"  策略 {stock['strategy_summary']}")
+            if stock.get("sector_overlap_count", 1) > 1:
+                lines.append(f"  板块共振 {'、'.join(stock.get('source_sectors', []))}")
             if stock.get("stop_profit_line") is not None:
                 lines.append(f"  参考止盈线 {stock['stop_profit_line']:.2f}")
+            if stock.get("anchored_breakout_signal"):
+                lines.append(
+                    f"  锚点 {stock['anchor_price']:.2f} | 类型 {get_anchor_type_label(stock.get('anchor_type'))} | 触碰 {stock.get('anchor_zone_touches', 0)} 次 | 突破日距今 {stock['anchored_breakout_day']} 天 | 回撤 {stock['anchor_pullback_pct']:.1f}%"
+                )
+                if stock.get("anchored_breakout_grade"):
+                    lines.append(f"  前高等级 {stock['anchored_breakout_grade']}")
+                if stock.get("volume_price_summary"):
+                    lines.append(f"  量价 {stock['volume_price_summary']}")
+            if stock.get("signal_breakdown_summary"):
+                lines.append(f"  信号拆解 {stock['signal_breakdown_summary']}")
             if stock["hot_topic"]:
                 lines.append(f"  热点 {stock['hot_topic']}")
             lines.append("")
     else:
         lines.extend(["- 今日暂无回踩买点个股", ""])
+
+    resonance_stocks = build_resonance_stocks(picks)
+    if resonance_stocks:
+        lines.extend(["共振股票", "-" * 40])
+        for stock in resonance_stocks[:5]:
+            lines.append(
+                f"- {stock['name']} {stock['code']} | 评分 {stock.get('score', 0):.2f} | 板块 {'、'.join(stock.get('source_sectors', []))}"
+            )
+        lines.append("")
 
     lines.extend([f"热门板块 TOP{hot_count}", "-" * 40])
     for index, sector in enumerate(classified["hot"], 1):
@@ -1928,6 +3378,14 @@ def generate_report(date_str, classified, picks, streaks, backtest, comparison, 
             lines.append(
                 f"   - {stock['name']} {stock['code']} | {stock['signal']} | 等级 {stock.get('signal_grade', '-')}{leader_tag} | {stock['summary']}"
             )
+            prior_high_detail = format_prior_high_detail(stock)
+            if prior_high_detail:
+                lines.append(f"     {prior_high_detail}")
+            if stock.get("signal_breakdown_summary"):
+                lines.append(f"     信号拆解: {stock['signal_breakdown_summary']}")
+            score_detail = format_score_components(stock)
+            if score_detail:
+                lines.append(f"     分数: {score_detail}")
         lines.append("")
 
     lines.extend([f"潜力板块 TOP{potential_count}", "-" * 40])
@@ -1942,6 +3400,14 @@ def generate_report(date_str, classified, picks, streaks, backtest, comparison, 
             lines.append(
                 f"   - {stock['name']} {stock['code']} | {stock['signal']} | 等级 {stock.get('signal_grade', '-')}{leader_tag} | {stock['summary']}"
             )
+            prior_high_detail = format_prior_high_detail(stock)
+            if prior_high_detail:
+                lines.append(f"     {prior_high_detail}")
+            if stock.get("signal_breakdown_summary"):
+                lines.append(f"     信号拆解: {stock['signal_breakdown_summary']}")
+            score_detail = format_score_components(stock)
+            if score_detail:
+                lines.append(f"     分数: {score_detail}")
         lines.append("")
 
     lines.extend(["板块轮动观察", "-" * 40])
@@ -1952,9 +3418,33 @@ def generate_report(date_str, classified, picks, streaks, backtest, comparison, 
         lines.append("- 暂无足够历史数据")
     lines.append("")
 
+    if scan_stats:
+        stage_counts = scan_stats.get("stage_counts", {})
+        reject_reasons = scan_stats.get("reject_reasons", {})
+        lines.extend(["筛选诊断", "-" * 40])
+        lines.append(
+            f"- 成员 {stage_counts.get('members_seen', 0)} | 扫描 {stage_counts.get('members_scanned', 0)} | 轻筛通过 {stage_counts.get('light_passed', 0)} | 评分通过 {stage_counts.get('score_passed', 0)} | 板块入选 {stage_counts.get('sector_selected', 0)} | 全局入选 {stage_counts.get('global_selected', 0)} | 去重 {stage_counts.get('deduplicated_count', 0)}"
+        )
+        if reject_reasons:
+            top_reasons = sorted(reject_reasons.items(), key=lambda item: item[1], reverse=True)[:8]
+            lines.append("- 淘汰原因: " + "；".join(f"{reason} {count}" for reason, count in top_reasons))
+        else:
+            lines.append("- 暂无淘汰原因统计")
+        lines.append("")
+
+    if edge_candidates:
+        lines.extend(["边缘候选", "-" * 40])
+        for item in edge_candidates[: config["edge_candidates_limit"]]:
+            lines.append(format_edge_candidate_line(item))
+            if item.get("signal_breakdown_summary"):
+                lines.append(f"  信号拆解: {item['signal_breakdown_summary']}")
+        lines.append("")
+
     lines.extend(["回测摘要", "-" * 40])
     if backtest and backtest.get("metrics"):
         lines.append(f"- 评估窗口: 最近 {backtest['sample_days']} 天")
+        entry_basis_label = "次日开盘" if backtest.get("entry_price_basis") == "next_open" else "信号日收盘"
+        lines.append(f"- 买入价口径: {entry_basis_label}")
         for day, metric in sorted(backtest["metrics"].items()):
             lines.append(
                 f"- 持有 {day} 天 | 样本 {metric['samples']} | 平均收益 {metric['avg_return']:+.2f}% | 胜率 {metric['win_rate']:.2f}%"
@@ -1982,8 +3472,16 @@ def generate_report(date_str, classified, picks, streaks, backtest, comparison, 
 
 
 def write_json_report(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as file:
         json.dump(payload, file, ensure_ascii=False, indent=2, default=json_default)
+
+
+def write_report_files(report_path, json_path, report, payload):
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(report_path, "w", encoding="utf-8") as file:
+        file.write(report)
+    write_json_report(json_path, payload)
 
 
 def print_network_diagnostics():
@@ -2001,6 +3499,7 @@ def run_analysis(args):
 
     ensure_dependencies()
     config = load_config()
+    RUNTIME_META["runtime_memory_cache_enabled"] = config.get("runtime_memory_cache", True)
     cache_only = bool(args.cache_only or args.offline)
     sector_filters = normalize_sector_filters(args.sector)
     if cache_only and args.no_cache:
@@ -2015,6 +3514,9 @@ def run_analysis(args):
 
     if args.sector_limit:
         config["_sector_limit"] = max(1, args.sector_limit)
+    if args.diagnose_screening:
+        args.skip_backtest = True
+        note("当前仅输出筛选诊断，不写入数据库。")
 
     analysis_date = args.date or datetime.now().strftime("%Y-%m-%d")
     today = datetime.now().strftime("%Y-%m-%d")
@@ -2076,9 +3578,6 @@ def run_analysis(args):
         use_cache=use_cache,
         cache_only=cache_only,
     )
-    all_stock_picks = []
-    seen_codes = set()
-
     login_needed = not cache_only and bool(classified["hot"] or classified["potential"] or not args.skip_backtest)
 
     if login_needed:
@@ -2089,22 +3588,13 @@ def run_analysis(args):
 
     backtest = None
     try:
-        for sector in classified["hot"] + classified["potential"]:
-            logger.info("screen sector: %s", sector["name"])
-            picks = screen_stocks_in_sector(
-                sector,
-                config,
-                analysis_date,
-                use_cache=use_cache,
-                cache_only=cache_only,
-            )
-            for stock in picks:
-                if stock["code"] not in seen_codes:
-                    seen_codes.add(stock["code"])
-                    all_stock_picks.append(stock)
-            if not cache_only:
-                time.sleep(0.5)
-
+        all_stock_picks, scan_diagnostics = screen_classified_sectors(
+            classified,
+            config,
+            analysis_date,
+            use_cache=use_cache,
+            cache_only=cache_only,
+        )
         enrich_stocks_with_concepts(all_stock_picks, concept_member_map, config)
 
         if not args.skip_backtest and (login_needed or cache_only):
@@ -2118,7 +3608,7 @@ def run_analysis(args):
         if login_needed:
             bs.logout()
 
-    allow_persist = analysis_date == today or using_historical_snapshot
+    allow_persist = (analysis_date == today or using_historical_snapshot) and not args.diagnose_screening
     if allow_persist:
         save_daily_results(analysis_date, classified, all_stock_picks)
         streaks = get_sector_streak(analysis_date)
@@ -2128,6 +3618,8 @@ def run_analysis(args):
 
     visible_classified = filter_classified_sectors(classified, sector_filters)
     visible_picks = apply_pick_filters(all_stock_picks, args, config)
+    normalized_scan = normalize_scan_diagnostics(scan_diagnostics)
+    edge_candidates = filter_edge_candidates(build_edge_candidates(scan_diagnostics, config), args, config)
     comparison = build_day_over_day_comparison(analysis_date, visible_classified, visible_picks, sector_filters=sector_filters)
     alerts = build_alerts(visible_classified, visible_picks, comparison, config)
     filters = {
@@ -2136,19 +3628,30 @@ def run_analysis(args):
         "min_score": args.min_score,
         "exclude_high_pe": args.exclude_high_pe,
         "alerts_only": args.alerts_only,
+        "diagnose_screening": args.diagnose_screening,
+        "no_output_files": getattr(args, "no_output_files", False),
     }
 
-    report = generate_report(
-        analysis_date,
-        visible_classified,
-        visible_picks,
-        streaks,
-        backtest,
-        comparison,
-        alerts,
-        config,
-        alerts_only=args.alerts_only,
-    )
+    scan_stats = {
+        "stage_counts": normalized_scan["stage_counts"],
+        "reject_reasons": normalized_scan["reject_reasons"],
+    }
+    if args.diagnose_screening:
+        report = generate_screening_diagnostics_report(analysis_date, scan_stats, edge_candidates)
+    else:
+        report = generate_report(
+            analysis_date,
+            visible_classified,
+            visible_picks,
+            streaks,
+            backtest,
+            comparison,
+            alerts,
+            config,
+            alerts_only=args.alerts_only,
+            scan_stats=scan_stats,
+            edge_candidates=edge_candidates,
+        )
     payload = build_payload(
         analysis_date,
         visible_classified,
@@ -2159,13 +3662,16 @@ def run_analysis(args):
         alerts,
         filters,
         config,
+        scan_diagnostics=scan_diagnostics,
+        edge_candidates=edge_candidates,
     )
 
-    report_path = REPORT_DIR / f"{analysis_date}.md"
-    json_path = Path(args.output_json) if args.output_json else REPORT_DIR / f"{analysis_date}.json"
-    with open(report_path, "w", encoding="utf-8") as file:
-        file.write(report)
-    write_json_report(json_path, payload)
+    if config.get("write_output_files", True) and not getattr(args, "no_output_files", False):
+        report_path = REPORT_DIR / f"{analysis_date}.md"
+        json_path = Path(args.output_json) if args.output_json else REPORT_DIR / f"{analysis_date}.json"
+        write_report_files(report_path, json_path, report, payload)
+    else:
+        note("本次运行未写入报告文件。")
 
     print("===REPORT_START===")
     print(report)
